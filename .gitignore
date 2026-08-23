@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.bak
+*.db
+*.db-shm
+*.db-wal
+.env
+session*.md
+tmp/
+.opencode/
+.DS_Store
