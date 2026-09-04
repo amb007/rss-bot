@@ -71,6 +71,8 @@ profile**, which the bot uses when scoring new articles.
 | `/set KEY VALUE` | Change a setting (e.g. `/set TOP_N 20`, `/set MIN_SCORE 5`). See the table below. |
 | `/model [NAME]` | Change or view the model used for scoring. Without a NAME it shows the current one. Persists to `.env` as the active backend's `<BACKEND>_MODEL`. |
 | `/backend [NAME]` | Switch which LLM backend does the scoring (switches the model with it). Only backends configured in `.env` are accepted; without a NAME it lists them. |
+| `/models` | List models discovered across your configured backends, with SWE-bench score and last-probe health. `/models refresh` re-discovers + re-probes now. |
+| `/automodel on\|off` | When on (default), a dead model auto-switches to the best live free model across your backends. |
 | `/stats` | The bot's stats — total articles, how many are new, scored, ignored... Good for checking what's going on. |
 | `/addfeed https://...` | Subscribe to a new RSS/Atom feed. You can also paste an article or homepage URL — the bot finds the real feed automatically |
 | `/removefeed [url]` | Unsubscribe. Two ways: reply to any article message (the bot finds its source feed) or pass the URL. |
@@ -91,6 +93,14 @@ It understands:
 | `ai NOT art` | "ai" but not "art" |
 | `NEAR(machine learning, 3)` | terms within 3 words |
 | `title:python summary:async` | column-scoped |
+
+**Prefix + hyphenated terms:** punctuation (`-`, `.`, `/`) splits words into
+separate tokens, and `*` is a prefix on the *last token only*.
+
+- `program*` → program, programming, …
+- `e-graph*` → auto-turned into `"e-graph"*`, matching `e-graph`, `e-graphs`,
+  `e-grapher`, … (anything with `graph…` after `e`)
+- To match `-`/`:` literally, quote it: `"e-graph"`.
 
 If the query fails FTS5 syntax, it's wrapped as a phrase (so you always get
 results instead of an error).

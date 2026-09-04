@@ -172,4 +172,157 @@ importlib.reload(r)
 
 assert [offsets[n] for n in ("alpha", "beta", "gamma")] == [0, 15, 30], offsets
 print("instance_phase_offset_seconds OK:", offsets)
+
+# --- smart fallback helpers ---
+assert r.normalize_model_name("Gemini 3 Flash (high)") == "gemini-3-flash"
+assert r.normalize_model_name("models/gemini-3.5-flash") == "gemini-3-5-flash"
+assert r.normalize_model_name("moonshotai/kimi-k2.6") == "moonshotai-kimi-k2-6"
+assert r._family_token("moonshotai/kimi-k2.6") == "kimi-k2", r._family_token("moonshotai/kimi-k2.6")
+assert r._family_token("nvidia/nemotron-3-ultra-550b-a55b") == "nemotron-3-ultra"
+print("normalize_model_name / _family_token OK")
+
+# _swe_score_for: exact normalized match, else family substring, else neutral 50
+swe = {"gemini-3-flash": 75.8, "kimi-k2-5": 70.8}
+assert r._swe_score_for("gemini-3-flash", swe) == 75.8
+assert r._swe_score_for("moonshotai/kimi-k2.6", swe) == 70.8  # family "kimi-k2" matches
+assert r._swe_score_for("nvidia/nemotron-3-ultra-550b-a55b", swe) == 50.0
+print("_swe_score_for OK")
+
+# probe_model: classify by HTTP status
+class _ProbeResp:
+    def __init__(self, code):
+        self.status_code = code
+
+orig_client = _httpx.AsyncClient
+async def _check_probe():
+    results = {}
+    class _P(_httpx.AsyncClient):
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a, **k): pass
+        async def post(self, url, headers=None, json=None):
+            return _ProbeResp(results["code"])
+    _httpx.AsyncClient = _P
+    try:
+        for code, want in [(200, "ok"), (429, "rate_limited"), (404, "gone"),
+                           (401, "gone"), (503, "down"), (422, "unknown")]:
+            results["code"] = code
+            got = await r.probe_model("nim", "x/y")
+            assert got == want, (code, got, want)
+    finally:
+        _httpx.AsyncClient = orig_client
+_asyncio.run(_check_probe())
+print("probe_model OK")
+
+# _looks_free heuristic: Zen -free suffix is the only reliable signal
+assert r._looks_free("zen", "nemotron-3-ultra-free") is True
+assert r._looks_free("zen", "claude-opus-4-7") is False
+assert r._looks_free("zen", "gpt-5.1") is False
+assert r._looks_free("nim", "nvidia/nemotron-3-ultra-550b-a55b") is None
+print("_looks_free OK")
+
+# --- /search query normalization (FTS5 prefix on hyphenated terms) ---
+# valid single-token / prefix queries pass through unchanged
+assert r.normalize_search_query("python") == "python"
+assert r.normalize_search_query("program*") == "program*"
+assert r.normalize_search_query("rust OR go") == "rust OR go"
+# hyphen makes it invalid FTS5 → wrapped as a quoted phrase
+assert r.normalize_search_query("e-graph") == '"e-graph"'
+# trailing '*' → phrase-prefix (star *outside* quotes), not swallowed
+assert r.normalize_search_query("e-graph*") == '"e-graph"*'
+print("normalize_search_query OK")
+
+# end-to-end: phrase-prefix actually matches plural + derived tokens
+with r.db() as c:
+    c.execute("DELETE FROM articles_fts")  # clear FTS index (rebuild next)
+    for i, t in enumerate(["e-graph equality saturation",
+                           "e-graphs for compilers",
+                           "e-grapher tool",
+                           "equality saturation only"]):
+        c.execute("INSERT INTO articles (id,url,title,source) VALUES (?,?,?,?)",
+                  (f"t{i}", f"http://x/{i}", t, "sx"))
+        c.execute("INSERT INTO articles_fts(rowid, title) VALUES (last_insert_rowid(), ?)", (t,))
+
+assert [r.search_articles('"e-graph"*', 10, 0)]  # ensure it runs
+assert len(r.search_articles('"e-graph"*', 10, 0)) == 3  # e-graph, e-graphs, e-grapher
+assert len(r.search_articles('"e-graph"', 10, 0)) == 1   # exact phrase only
+print("phrase-prefix matching OK")
+
+# make_article_msg renders the card (no text reaction — reactions are applied
+# via set_message_reaction in _send_cards instead)
+base = {"score": 42, "confidence": None, "title": "T", "source": "S",
+        "url": "http://x", "hn_points": None, "hn_comments": None,
+        "liked_at": None, "disliked_at": None}
+assert r.make_article_msg(base).startswith("42")
+assert "<a href=\"http://x\">T</a>" in r.make_article_msg(base)
+print("make_article_msg OK")
+
+# _is_text_model excludes image/tts/embedding/etc from fallback candidates
+assert r._is_text_model("nvidia/nemotron-3-ultra-550b-a55b")
+assert r._is_text_model("gemini-3-flash-preview")
+assert not r._is_text_model("gemini-3-pro-image-preview")
+assert not r._is_text_model("gemini-3.1-flash-image")
+assert not r._is_text_model("gemini-2.5-pro-preview-tts")
+assert not r._is_text_model("text-embedding-004")
+print("_is_text_model OK")
+
+# 429-storm fallback: consecutive exhausted 429s trigger _fallback_and_switch
+_429_err = _httpx.HTTPStatusError("too many requests", request=_httpx.Request("POST", "http://x"),
+                                  response=_httpx.Response(429, headers={}))
+
+async def _always_429(messages, max_tokens):
+    raise _429_err
+
+orig_throttle = r._llm_throttle
+async def _no_throttle():
+    return
+r._llm_throttle = _no_throttle   # speed up: no real throttle in tests
+
+orig_request = r._llm_request
+switches = []
+async def _fake_fallback(status):
+    switches.append(status)
+    return False   # no fallback selected → llm_chat must raise
+r._llm_request = _always_429
+try:
+    orig_fb = r._fallback_and_switch
+    r._fallback_and_switch = _fake_fallback
+    r._consec_429_storms = 0
+    try:
+        for i in range(r._429_STORM_LIMIT):
+            try:
+                _asyncio.run(r.llm_chat([{"role": "user", "content": "x"}], retries=1))
+                assert False, "should have raised"
+            except _httpx.HTTPStatusError:
+                pass
+    finally:
+        r._fallback_and_switch = orig_fb
+    # storms 1..limit-1 → plain re-raise (no fallback attempted);
+    # storm #limit → _fallback_and_switch(None) (model treated as degraded)
+    assert switches == [None], switches
+    print("429-storm fallback OK — switches:", switches)
+finally:
+    r._llm_request = orig_request
+    r._llm_throttle = orig_throttle
+    r._consec_429_storms = 0
+
+# notify_owner is best-effort and must never raise
+_asyncio.run(r.notify_owner("test notification"))
+print("notify_owner OK")
+
+# env: prefix resolution in .env
+_os = __import__("os")
+_os.environ["TEST_REAL"] = "s3c"
+_os.environ["TEST_ALIAS"] = "env:TEST_REAL"
+_os.environ["TEST_CHAIN"] = "env:TEST_ALIAS"
+_os.environ["TEST_MISSING"] = "env:NOT_SET"
+r._resolve_env_refs()
+assert _os.environ["TEST_ALIAS"] == "s3c", "single env: ref failed"
+assert _os.environ["TEST_CHAIN"] == "s3c", "chained env: ref failed"
+assert _os.environ["TEST_MISSING"] == "", "missing ref not cleared"
+# cleanup
+for k in ["TEST_REAL", "TEST_ALIAS", "TEST_CHAIN", "TEST_MISSING"]:
+    _os.environ.pop(k, None)
+print("env: prefix resolution OK")
+
 print("ALL TESTS PASSED")

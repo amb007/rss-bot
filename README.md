@@ -5,9 +5,9 @@ against your interests, and pushes a daily digest to your Telegram chat. The
 **whole service is per-user**: each bot instance gets its own data directory,
 token, chat, feeds, database, and log.
 
-It is designed to host any number of instances (one directory each, see
-below); adding a new one — for yourself or a friend — is a ~10-minute
-copy-paste job. This file walks you through the whole thing.
+The example installation below hosts two live instances; adding a third
+friend/bot is a ~10-minute copy-paste job. This file walks you through the
+whole thing.
 
 ---
 
@@ -17,11 +17,11 @@ copy-paste job. This file walks you through the whole thing.
 ~/.rss-bot/
 ├── rss_bot.py              # single shared bot implementation
 ├── README.md
-├── alice/                  # instance 1
+├── alice/                   # instance 1 (owner "alice")
 │   ├── .env                # token, chat id, LLM backend, tuning knobs
 │   ├── feeds.txt            # one feed URL per line
 │   └── rss_bot.db           # sqlite: articles, profile, settings, ...
-└── bob/                    # instance 2 (a friend's bot)
+└── bob/                   # instance 2 (a friend's bot)
     ├── .env
     ├── feeds.txt
     └── rss_bot.db
@@ -43,10 +43,29 @@ load_dotenv(RSS_DIR / ".env")
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
-...
-FEEDS_FILE = Path(os.environ.get("FEEDS_FILE", str(RSS_DIR / "feeds.txt")))
-DB_PATH    = RSS_DIR / "rss_bot.db"
 ```
+
+---
+
+## Secrets via environment (the `env:` prefix)
+
+You can keep API keys out of `.env` files by writing `env:VAR_NAME` as the
+value. At startup, `rss_bot.py` resolves any `env:VAR` token against the real
+process environment. This lets you keep secrets out of `.env` files entirely:
+
+```ini
+NIM_API_KEY=env:NVIDIA_API_KEY
+GOO_API_KEY=env:GOOGLE_AI_STUDIO_API_KEY
+ZEN_API_KEY=env:OPENCODE_API_KEY
+```
+
+When the bot starts, it resolves each `env:VAR` token by looking up `VAR` in
+the process environment. If a referenced variable is missing, a warning is
+logged and the value is cleared (so you get a loud 401 instead of a silent
+failure). Chained references (`A=env:B`, `B=env:C`) are also supported.
+
+This lets you keep real keys in your shell environment (e.g. `direnv`,
+or macOS launchd) and only keep non-secret config in `.env` files.
 
 - If `RSS_DIR` is set (by launchd/nix), the instance is fully self-contained in
   that directory (feeds file, database, settings).
@@ -80,7 +99,7 @@ app.add_handler(MessageReactionHandler(handle_reaction, chat_id=TELEGRAM_CHAT_ID
 | Variable | Example | Purpose |
 |---|---|---|
 | `TELEGRAM_TOKEN` | `123456:ABC...` | Bot token from @BotFather (one per bot, do not share) |
-| `TELEGRAM_CHAT_ID` | `42` | Numeric id of the owner chat; **the only authorized chat** |
+| `TELEGRAM_CHAT_ID` | `123456789` | Numeric id of the owner chat; **the only authorized chat** |
 | `LLM_BACKEND` | `llamacpp` / `nim` / `zen` | Active LLM backend used for scoring (switched with `/backend`) |
 | `<BACKEND>_BASE_URL` | `zen` → `https://opencode.ai/zen/v1` | OpenAI-compatible endpoint for that backend (e.g. `ZEN_BASE_URL`, `NIM_BASE_URL`, `LLAMACPP_BASE_URL`) |
 | `<BACKEND>_MODEL` | `zen` → `deepseek-v4-flash-free` | Model name for that backend; `/model` writes to the active backend (e.g. `ZEN_MODEL`) |
@@ -95,11 +114,36 @@ app.add_handler(MessageReactionHandler(handle_reaction, chat_id=TELEGRAM_CHAT_ID
 | `ARTICLE_MAX_AGE_DAYS` | `7` | Scrape/articles older than this are dropped |
 | `LLM_MIN_INTERVAL` | `3` | Minimum seconds between LLM API calls (spaces out scoring under rate limits) |
 | `LLM_MAX_RETRIES` | `4` | Retries per LLM request on failure/429, with backoff |
+| `AUTOMODEL_ENABLED` | `1` | Auto-switch to a live model when the current one dies (`/automodel`) |
+| `SWE_REFRESH_DAYS` | `7` | How often to re-fetch the SWE-bench leaderboard (fallback ranking) |
 
 Settings come from `.env` (env vars win), then the `settings` table in the
 instance DB, then `SETTING_DEFAULTS`.
 
 `feeds.txt` is one feed URL per line, e.g. `http://arxiv.org/rss/cs.SE`.
+
+### Smart model fallback
+
+If the active model returns a dead status (404/410/401/403, or repeatedly
+times out/5xx) and `AUTOMODEL_ENABLED` is on, the bot:
+
+1. Discovers live model IDs from every configured backend's `/models` endpoint,
+2. Filters out non-text models (image/tts/embedding/…) — they can pass a probe
+   but can't score articles,
+3. Probes each candidate's `/chat/completions` to verify it actually serves,
+4. Ranks working candidates by **SWE-bench** coding score (fetched live from
+   swebench.com, cached weekly) × same-family × same-backend,
+5. Switches to the best working model via `/model`-equivalent persistence, and
+   notifies the owner in Telegram.
+
+A **429 storm** (the free-tier rate limit that never resolves, e.g. a model
+whose quota is exhausted) also triggers fallback: after
+`_429_STORM_LIMIT` consecutive retry-exhausted 429 calls, the model is treated
+as degraded and switched away from.
+
+`/models` lists discovered models with their SWE% and last-probe health;
+`/models refresh` forces a rediscovery + probe. There's no static model list —
+availability is always verified on demand, since provider catalogs churn.
 
 ---
 
@@ -136,7 +180,7 @@ point `<BACKEND>_BASE_URL` (e.g. `LLAMACPP_BASE_URL`) at a local
 | `/scoreall` | Force-scoring all unscored articles |
 | `/addfeed <url>` | Add a feed (auto-detects from a page/URL — accepts a story or homepage URL too) |
 | `/removefeed <url>` | Remove a feed |
-| `/search <q>` | Free-text search over the local DB (with pagination buttons) |
+| `/search <q>` | Full-text search over the local DB (SQLite FTS5; pagination buttons) |
 
 Reacting 👍/👌/etc. to an article marks it liked; other reactions mark it
 ignored.
@@ -150,11 +194,28 @@ The `/search` command uses SQLite's built-in FTS5 full-text search over article
 |---|---|---|
 | simple term | `python` | contains "python" |
 | exact phrase | `"machine learning"` | exact phrase match |
-| prefix / wildcard | `program*` | words starting with "program" |
+| prefix | `program*` | words starting with "program" |
 | boolean OR | `rust OR go` | either term |
 | boolean NOT | `python NOT snake` | contains "python" but not "snake" |
 | NEAR | `NEAR(ai model, 5)` | terms within 5 words |
 | column-specific | `title:rust summary:async` | "rust" in title, "async" in summary |
+
+### Prefix search and hyphenated terms
+
+Punctuation — `-`, `.`, `/`, etc. — **splits words into separate tokens**
+(the `unicode61` tokenizer), so a plain search for `e-graph` actually matches
+the tokens `e` *and* `graph`, not the literal string `e-graph`.
+
+`*` is a **prefix operator on the final token only**:
+
+- `program*` → program, programming, programmer, …
+- `e-graph*` → the trailing `*` is detected and turned into a phrase-prefix
+  (`"e-graph"*`), so it matches `e-graph`, `e-graphs`, `e-grapher`, … —
+  anything where `graph` is a prefix after `e`.
+- Multi-word works too: `machine learn*` → "learn", "learning", …
+
+Note `-` and `:` are FTS5 operators (column scoping / negation), not literal
+characters. To search them literally, quote the phrase: `"e-graph"`.
 
 Invalid FTS5 syntax is automatically wrapped as a quoted phrase (so it always
 returns results instead of erroring).
@@ -163,25 +224,23 @@ returns results instead of erroring).
 
 ## Running under nix-darwin (launchd)
 
-Each instance is declared as a launchd user agent in your nix-darwin module
-(e.g. `~/.config/nix-darwin/modules/system.nix`):
+Both instances are declared as launchd user agents in
+`~/.config/nix-darwin/modules/system.nix`:
 
 ```nix
 launchd.user.agents.rssbot-alice = {
   serviceConfig = {
     Label            = "com.rssbot-alice";
-    ProgramArguments = [ "${python}"
-                         "${home}/.rss-bot/rss_bot.py" ];
-    WorkingDirectory = "${home}/.rss-bot/alice";
-    EnvironmentVariables = { RSS_DIR = "${home}/.rss-bot/alice"; };
+    ProgramArguments = [ "/Users/alice/venv/python313/bin/python3"
+                         "/Users/alice/.rss-bot/rss_bot.py" ];
+    WorkingDirectory = "/Users/alice/.rss-bot/alice";
+    EnvironmentVariables = { RSS_DIR = "/Users/alice/.rss-bot/alice"; };
     RunAtLoad        = true;
     KeepAlive        = true;
     StandardOutPath  = "/tmp/rssbot-alice.log";
     StandardErrorPath = "/tmp/rssbot-alice.log";
   };
 };
-
-# (replace ${python} with your interpreter path, ${home} with your home dir)
 ```
 
 Adding an instance is: add the `.env` + `feeds.txt` + agent block (with its own
@@ -195,7 +254,7 @@ sudo darwin-rebuild switch
 
 ### Manual control (without rebuilding nix)
 
-The plists live at `~/Library/LaunchAgents/com.rssbot-<name>.plist`,
+The plists live at `/Users/alice/Library/LaunchAgents/com.rssbot-<name>.plist`,
 label `com.rssbot-<name>`.
 
 ```
@@ -207,17 +266,17 @@ launchctl kickstart -k gui/$(id -u)/com.rssbot-alice
 
 # stop / start
 launchctl bootout   gui/$(id -u)/com.rssbot-alice
-launchctl bootstrap gui/$(id -u)/com.rssbot-alice ~/Library/LaunchAgents/com.rssbot-alice.plist
+launchctl bootstrap gui/$(id -u)/com.rssbot-alice /Users/alice/Library/LaunchAgents/com.rssbot-alice.plist
 ```
 
 ---
 
 ## Current instances
 
-| Instance | Data dir | `RSS_DIR` | Log |
-|---|---|---|---|
-| alice | `~/.rss-bot/alice` | `.../alice` | `/tmp/rssbot-alice.log` |
-| bob | `~/.rss-bot/bob` | `.../bob` | `/tmp/rssbot-bob.log` |
+| Instance | Owner bot | Data dir | `RSS_DIR` | Log |
+|---|---|---|---|---|
+| alice | `@my_rss_filter_bot` | `~/.rss-bot/alice` | `.../alice` | `/tmp/rssbot-alice.log` |
+| bob | `@my_feedly_bot` | `~/.rss-bot/bob` | `.../bob` | `/tmp/rssbot-bob.log` |
 
 > **Gotcha:** each bot pushes only to its own `TELEGRAM_CHAT_ID`. If a friend
 > is messaging *your* bot in a shared admin chat, they talk to your feed and
@@ -226,24 +285,13 @@ launchctl bootstrap gui/$(id -u)/com.rssbot-alice ~/Library/LaunchAgents/com.rss
 
 ---
 
-## Quick start (no nix)
-
-```bash
-pip install -r requirements.txt
-mkdir myinstance && cp .env.example myinstance/.env   # fill in token, chat id, LLM backend
-echo "https://example.org/feed" > myinstance/feeds.txt
-RSS_DIR=$PWD/myinstance python rss_bot.py
-```
-
----
-
 ## Debug / ops notes
 
 - Logs: `/tmp/rssbot-<name>.log` (the same file for stdout and stderr).
-- Database: sqlite3, `~/.rss-bot/<name>/rss_bot.db` (created on first run).
-  Handy quick checks:
+- Database: sqlite3, `~/.rss-bot/<name>/rss_bot.db`. Handy quick checks:
   ```
-  sqlite3 ~/.rss-bot/<name>/rss_bot.db "SELECT COUNT(*) FROM articles"
+  sqlite3 /Users/alice/.rss-bot/alice/rss_bot.db "SELECT COUNT(*) FROM articles"
+  sqlite3 /Users/alice/.rss-bot/bob/rss_bot.db "SELECT COUNT(*) FROM articles"
   ```
 - The scraper uses concurrent workers, so don't set a huge poll interval.
 - `rss_bot.py` has no comments; keep changes minimal and spellcheck the logs —

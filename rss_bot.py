@@ -31,6 +31,30 @@ RSS_DIR = Path(os.environ.get("RSS_DIR", str(Path(__file__).resolve().parent)))
 from dotenv import load_dotenv
 load_dotenv(RSS_DIR / ".env")
 
+def _resolve_env_refs() -> None:
+    """Values written as `env:VAR` in .env inherit VAR from the process
+    environment (fixpoint to support chained refs). Never prints values."""
+    for _ in range(8):   # fixpoint; warns below on unresolvable refs
+        unresolved = False
+        for key in list(os.environ):
+            val = os.environ[key]
+            if val.startswith("env:"):
+                ref = val[4:].strip()
+                target = os.environ.get(ref)
+                if target is not None and not target.startswith("env:"):
+                    os.environ[key] = target
+                else:
+                    unresolved = True
+        if not unresolved:
+            break
+    for key in list(os.environ):   # leftover env: refs → warn (names only)
+        val = os.environ[key]
+        if val.startswith("env:"):
+            logging.warning(f"{key}: referenced env var {val[4:].strip()!r} is not set; value left unset")
+            os.environ[key] = ""
+
+_resolve_env_refs()
+
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 LLM_BACKEND      = os.environ.get("LLM_BACKEND", "llamacpp")
@@ -54,15 +78,18 @@ def instance_phase_offset_seconds() -> int:
 SETTING_DEFAULTS = {
     "DIGEST_HOUR":          "8",
     "IGNORE_AFTER_H":       "12",
-    "TOP_N":                "30",
+    "TOP_N":                "8",
     "MIN_SCORE":            "10",
     "PROFILE_EXAMPLES":     "30",
     "SCORE_BATCH":          "10",
     "ARTICLE_MAX_AGE_DAYS": "7",
     "IGNORE_SCORE_FLOOR":   "80",
-    "SEARCH_BATCH":         "10",
+    "SEARCH_BATCH":         "8",
+    "MODELS_PER_PAGE":      "15",
     "LLM_MIN_INTERVAL":     "3",
     "LLM_MAX_RETRIES":      "4",
+    "AUTOMODEL_ENABLED":    "1",
+    "SWE_REFRESH_DAYS":     "7",
 }
 
 # URL rewrite: feed servers that return wrong article links.
@@ -172,7 +199,7 @@ def init_db():
             fetched_at  TEXT,
             sent_at     TEXT,
             opened_at   TEXT,
-            shared_at   TEXT,
+            liked_at    TEXT,
             ignored_at  TEXT,
             tg_msg_id   INTEGER
         );
@@ -193,6 +220,18 @@ def init_db():
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
             value TEXT
+        );
+        CREATE TABLE IF NOT EXISTS swe_scores (
+            model_family TEXT PRIMARY KEY,
+            resolved_pct REAL,
+            fetched_at   TEXT
+        );
+        CREATE TABLE IF NOT EXISTS model_health (
+            backend     TEXT NOT NULL,
+            model_id    TEXT NOT NULL,
+            last_status TEXT,
+            last_seen   TEXT,
+            PRIMARY KEY (backend, model_id)
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
             title, summary, content='articles', content_rowid='rowid',
@@ -224,6 +263,15 @@ def init_db():
                 c.execute(f"ALTER TABLE articles ADD COLUMN {col} {typedef}")
         except Exception:
             pass
+    # rename legacy shared_at → liked_at (idempotent, only if old column exists)
+    try:
+        with db() as c:
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(articles)").fetchall()}
+        if "shared_at" in cols and "liked_at" not in cols:
+            with db() as c:
+                c.execute("ALTER TABLE articles RENAME COLUMN shared_at TO liked_at")
+    except Exception:
+        pass
 
     # sync feeds.txt ↔ feeds table
     _sync_feeds_with_file()
@@ -609,9 +657,12 @@ def _retry_wait(attempt: int, response=None) -> float:
         return 5 * (attempt + 1)
     return 2 ** attempt
 
-async def llm_chat(messages: list[dict], max_tokens=512, retries=None) -> str:
-    if retries is None:
-        retries = int(S("LLM_MAX_RETRIES"))
+_DEAD_STATUSES = {401, 403, 404, 405, 410}   # model gone / not-authorized → no point retrying
+_429_STORM_LIMIT = 3   # consecutive retry-exhausted 429 calls before we treat
+                       # a rate-limited model as degraded and fall back
+_consec_429_storms = 0
+
+async def _llm_request(messages: list[dict], max_tokens: int) -> str:
     headers = {"Content-Type": "application/json"}
     if llm_api_key():
         headers["Authorization"] = f"Bearer {llm_api_key()}"
@@ -622,30 +673,95 @@ async def llm_chat(messages: list[dict], max_tokens=512, retries=None) -> str:
         # NIM-specific params: disable thinking tokens
         payload["chat_template_kwargs"] = {"enable_thinking": False}
         payload["thinking"] = False
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(f"{llm_base_url()}/chat/completions", headers=headers, json=payload)
+        r.raise_for_status()
+        msg = r.json()["choices"][0]["message"]
+        content   = (msg.get("content") or "").strip()
+        reasoning = (msg.get("reasoning_content") or "").strip()
+        text = content if content else reasoning
+        text = re.sub(r" thinking.*? response", "", text, flags=re.DOTALL).strip()
+        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+        text = re.sub(r"\*(.*?)\*",     r"\1", text)
+        text = re.sub(r"`(.*?)`",       r"\1", text)
+        return text
+
+async def notify_owner(text: str) -> None:
+    """Best-effort push message to the owner chat via the raw Bot API.
+    Used from deep call paths (e.g. automodel switch) that have no bot handle."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    except Exception as e:
+        logging.warning(f"notify_owner failed: {e}")
+
+async def _fallback_and_switch(status: int | None) -> bool:
+    """On a dead model, discover+probe a replacement and switch to it (once)."""
+    if status is not None and status not in _DEAD_STATUSES and status < 500:
+        return False  # 400/422 = payload bug, not a dead model — don't mask it
+    if not S("AUTOMODEL_ENABLED"):
+        return False
+    try:
+        selection = await select_fallback(current_llm_model())
+    except Exception as e:
+        logging.warning(f"Fallback failed: {e}")
+        return False
+    if not selection:
+        logging.warning("No working fallback model found.")
+        return False
+    new_backend, new_model = selection
+    if new_backend != current_llm_backend():
+        set_llm_backend(new_backend)
+    set_llm_model(new_model)
+    logging.warning(f"Auto-switched LLM → {new_model} (backend {new_backend})")
+    await notify_owner(
+        f"⚠️ LLM auto-switched → {new_model} ({new_backend}) — old model died."
+        " Use /model to override.")
+    return True
+
+async def llm_chat(messages: list[dict], max_tokens=512, retries=None) -> str:
+    if retries is None:
+        retries = int(S("LLM_MAX_RETRIES"))
+    global _consec_429_storms
     for attempt in range(retries):
         await _llm_throttle()
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                r = await client.post(f"{llm_base_url()}/chat/completions", headers=headers, json=payload)
-                r.raise_for_status()
-                msg = r.json()["choices"][0]["message"]
-                content   = (msg.get("content") or "").strip()
-                reasoning = (msg.get("reasoning_content") or "").strip()
-                text = content if content else reasoning
-                text = re.sub(r" thinking.*? response", "", text, flags=re.DOTALL).strip()
-                text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-                text = re.sub(r"\*(.*?)\*",     r"\1", text)
-                text = re.sub(r"`(.*?)`",       r"\1", text)
-                return text
+            result = await _llm_request(messages, max_tokens)
+            _consec_429_storms = 0
+            return result
         except httpx.HTTPStatusError as e:
-            if attempt >= retries - 1:
-                raise
             status = e.response.status_code
+            # dead model → no point retrying, go straight to fallback
+            if status in _DEAD_STATUSES:
+                if await _fallback_and_switch(status):
+                    await _llm_throttle()
+                    return await _llm_request(messages, max_tokens)
+                raise
+            if attempt >= retries - 1:
+                # a sticky 429 means the model is rate-limited *persistently* —
+                # after N consecutive storms treat it as degraded and fall back
+                if status == 429:
+                    _consec_429_storms += 1
+                    if _consec_429_storms >= _429_STORM_LIMIT:
+                        logging.warning(f"429 storm x{_consec_429_storms} — treating model as degraded")
+                        _consec_429_storms = 0
+                        if await _fallback_and_switch(None):
+                            await _llm_throttle()
+                            return await _llm_request(messages, max_tokens)
+                elif await _fallback_and_switch(status):
+                    await _llm_throttle()
+                    return await _llm_request(messages, max_tokens)
+                raise
             wait = _retry_wait(attempt, e.response)
             logging.warning(f"LLM call failed ({status}), retrying in {wait}s...")
             await asyncio.sleep(wait)
         except Exception as e:
             if attempt >= retries - 1:
+                if await _fallback_and_switch(None):
+                    await _llm_throttle()
+                    return await _llm_request(messages, max_tokens)
                 raise
             wait = _retry_wait(attempt)
             logging.warning(f"LLM call failed ({e}), retrying in {wait}s...")
@@ -664,6 +780,206 @@ async def llm_startup_check():
     except Exception as e:
         logging.error(f"LLM startup check FAILED: {e!r} — "
                       f"backend={current_llm_backend()} url={llm_base_url()!r} model={current_llm_model()!r}")
+
+# ── smart model fallback ───────────────────────────────────────────────────────
+# Discovers live free model candidates from the configured backends, probes them
+# to verify they actually serve chat completions, and ranks them by SWE-bench
+# coding skill (fetched live from swebench.com) × same-backend/same-family
+# stickiness. No static model list — availability is always verified on demand.
+
+SWEBENCH_URL = "https://www.swebench.com/"
+PROBE_TIMEOUT = 12
+PROBE_MAX_CANDIDATES = 25
+
+def _model_base_url(backend: str) -> str:
+    b = backend.upper()
+    return (os.environ.get(f"{b}_BASE_URL") or LLM_BASE_URL
+            or "http://localhost:8080/v1")
+
+def _model_api_key(backend: str) -> str:
+    b = backend.upper()
+    return os.environ.get(f"{b}_API_KEY") or LLM_API_KEY
+
+def normalize_model_name(name: str) -> str:
+    """'Gemini 3 Flash (high)' → 'gemini-3-flash'; 'models/gemini-3.5-flash' →
+    'gemini-3-5-flash'; 'moonshotai/kimi-k2.6' → 'moonshotai-kimi-k2-6'."""
+    s = name.lower()
+    s = re.sub(r"\s*\([^)]*\)", "", s)          # drop "(high)" etc.
+    s = re.sub(r"^models?/", "", s)             # google "models/" prefix
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    return s.strip("-")
+
+def _family_token(model_id: str) -> str:
+    """Heuristic family key: last path segment with size/version/params stripped.
+
+    'moonshotai/kimi-k2.6' → 'kimi-k2'   (patch version dropped)
+    'nvidia/nemotron-3-ultra-550b-a55b' → 'nemotron-3-ultra'   (MoE sizes dropped)
+
+    Used only as a same-family tiebreak in fallback ranking."""
+    seg = model_id.rsplit("/", 1)[-1].lower()
+    # trailing MoE active-params token: -a55b, -a3b
+    seg = re.sub(r"-a\d+[a-z]?$", "", seg)
+    # trailing size/version token: -550b, -30b, -3.5, -v2, .6
+    seg = re.sub(r"[-_.]\d+(\.\d+)*[a-z]*$", "", seg)
+    return seg.strip("-_. ")
+
+def _swe_score_for(model_id: str, swe: dict) -> float:
+    """Best-effort SWE score: exact normalized match, else family substring."""
+    key = normalize_model_name(model_id)
+    if key in swe:
+        return swe[key]
+    fam = _family_token(model_id)
+    best = None
+    for k, v in swe.items():
+        if fam and (fam in k or k in fam) and len(fam) >= 4:
+            if best is None or v > best:
+                best = v
+    return best if best is not None else 50.0
+
+async def _fetch_swe_scores() -> dict[str, float]:
+    """Fetch SWE-bench leaderboard from swebench.com (inline JSON) → {family: %}.
+
+    Returns {} on any failure; callers treat unknown models as 50 (neutral)."""
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            r = await client.get(SWEBENCH_URL, headers={"User-Agent": FEED_UA})
+            r.raise_for_status()
+        scripts = re.findall(r"<script[^>]*>(.*?)</script>", r.text, re.DOTALL)
+        big = next((s for s in scripts if s.strip().startswith("[")), None)
+        if not big:
+            return {}
+        data = json.loads(big)
+    except Exception as e:
+        logging.warning(f"SWE fetch failed: {e}")
+        return {}
+    best: dict[str, float] = {}
+    for bench in data:
+        for res in bench.get("results", []):
+            name = res.get("name", "").strip()
+            resolved = res.get("resolved")
+            if not name or resolved is None:
+                continue
+            key = normalize_model_name(name)
+            if key and (key not in best or resolved > best[key]):
+                best[key] = float(resolved)
+    return best
+
+def _store_swe_scores(swe: dict) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as c:
+        c.executemany(
+            "INSERT OR REPLACE INTO swe_scores (model_family, resolved_pct, fetched_at) "
+            "VALUES (?,?,?)",
+            [(k, v, now) for k, v in swe.items()])
+
+def _load_swe_scores() -> dict[str, float]:
+    with db() as c:
+        rows = c.execute("SELECT model_family, resolved_pct FROM swe_scores").fetchall()
+    return {r["model_family"]: r["resolved_pct"] for r in rows}
+
+async def refresh_swe_scores() -> dict[str, float]:
+    """Fetch fresh SWE scores (or return cached on failure) and persist."""
+    fresh = await _fetch_swe_scores()
+    if fresh:
+        _store_swe_scores(fresh)
+        logging.info(f"SWE scores refreshed: {len(fresh)} families")
+        return fresh
+    cached = _load_swe_scores()
+    if cached:
+        logging.info(f"SWE fetch failed — using {len(cached)} cached families")
+    return cached
+
+async def discover_models(backend: str) -> list[str]:
+    """List model IDs exposed by a backend's /models endpoint."""
+    base = _model_base_url(backend)
+    key = _model_api_key(backend)
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(f"{base}/models", headers=headers)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        logging.warning(f"discover_models({backend}) failed: {e}")
+        return []
+    ids = [m.get("id", "") for m in data.get("data", [])]
+    if backend.lower() == "goo":
+        ids = [i[len("models/"):] if i.startswith("models/") else i for i in ids]
+    return [i for i in ids if i]
+
+async def probe_model(backend: str, model_id: str) -> str:
+    """Probe a model's /chat/completions with max_tokens=1.
+
+    Returns 'ok' | 'rate_limited' | 'gone' | 'down' | 'timeout' | 'unknown'."""
+    base = _model_base_url(backend)
+    key = _model_api_key(backend)
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    payload = {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
+               "max_tokens": 1}
+    if backend.lower() == "nim":
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload["thinking"] = False
+    try:
+        async with httpx.AsyncClient(timeout=PROBE_TIMEOUT) as client:
+            r = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
+    except Exception:
+        return "timeout"
+    s = r.status_code
+    if s == 200:
+        return "ok"
+    if s == 429:
+        return "rate_limited"
+    if s in (401, 403, 404, 405, 410):
+        return "gone"
+    if s >= 500:
+        return "down"
+    return "unknown"   # 400, 422, … → not a chat model / unsupported params
+
+def _record_health(backend: str, model_id: str, status: str) -> None:
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO model_health (backend, model_id, last_status, last_seen) "
+                  "VALUES (?,?,?,?)",
+                  (backend, model_id, status, datetime.now(timezone.utc).isoformat()))
+
+_NON_TEXT_MODEL_RE = re.compile(
+    r"image|imagen|tts|audio|video|whisper|embed|rerank|dall|veo|sora", re.I)
+
+def _is_text_model(model_id: str) -> bool:
+    """Filter out models that can't serve text chat (image/tts/embedding/…), so
+    a lucky probe never lets the fallback pick e.g. an image model for scoring."""
+    return not _NON_TEXT_MODEL_RE.search(model_id)
+
+async def select_fallback(current_model: str) -> tuple[str, str] | None:
+    """Find the best working free model across configured backends.
+
+    Returns (backend, model_id) or None. Prefers same family, same backend,
+    then highest SWE score. Verifies availability with a live probe."""
+    swe = _load_swe_scores() or await refresh_swe_scores()
+    current_backend = current_llm_backend()
+    candidates: list[tuple[float, str, str]] = []
+    for b in known_backends():
+        models = await discover_models(b)
+        for mid in models:
+            if b == current_backend and mid == current_model:
+                continue  # skip the model that just failed
+            if not _is_text_model(mid):
+                continue  # image/tts/embedding models can't score text
+            score = _swe_score_for(mid, swe)
+            if b == current_backend:
+                score += 3
+            if _family_token(mid) and _family_token(mid) == _family_token(current_model):
+                score += 5
+            candidates.append((score, b, mid))
+    candidates.sort(key=lambda x: -x[0])
+    for score, b, mid in candidates[:PROBE_MAX_CANDIDATES]:
+        status = await probe_model(b, mid)
+        _record_health(b, mid, status)
+        if status in ("ok", "rate_limited"):
+            logging.info(f"Fallback selected: {mid} ({b}) — score {score:.0f}")
+            return b, mid
+    return None
 
 def get_taste_profile() -> str:
     with db() as c:
@@ -745,7 +1061,7 @@ async def score_unscored():
         with db() as c:
             positives = c.execute("""
                 SELECT title, source, score FROM articles
-                WHERE shared_at IS NOT NULL ORDER BY shared_at DESC LIMIT ?
+                WHERE liked_at IS NOT NULL ORDER BY liked_at DESC LIMIT ?
             """, (S("PROFILE_EXAMPLES"),)).fetchall()
             disliked = c.execute("""
                 SELECT title, source, score FROM articles
@@ -840,7 +1156,7 @@ def mark_ignored():
         c.execute("""
             UPDATE articles SET ignored_at = ?
             WHERE sent_at IS NOT NULL AND sent_at < ?
-              AND opened_at IS NULL AND shared_at IS NULL
+              AND opened_at IS NULL AND liked_at IS NULL
               AND ignored_at IS NULL AND disliked_at IS NULL
               AND (score IS NULL OR score < ?)
         """, (datetime.now(timezone.utc).isoformat(), cutoff, floor))
@@ -851,7 +1167,7 @@ async def update_taste_profile(user_instruction: str = ""):
     with db() as c:
         pos = c.execute("""
             SELECT title, source, summary FROM articles
-            WHERE shared_at IS NOT NULL ORDER BY shared_at DESC LIMIT ?
+            WHERE liked_at IS NOT NULL ORDER BY liked_at DESC LIMIT ?
         """, (S("PROFILE_EXAMPLES"),)).fetchall()
         liked_sources = {r["source"] for r in pos}
         disliked = c.execute("""
@@ -895,19 +1211,21 @@ Reply with ONLY the new profile text, no preamble, no headers."""
 
 # ── digest ────────────────────────────────────────────────────────────────────
 
-_last_digest_ids: list[str] = []
-
-def build_digest(n=None) -> list[sqlite3.Row]:
-    if n is None:
-        n = S("TOP_N")
+def digest_snapshot() -> list[dict]:
+    """Full ordered list of ready (unread) articles as dicts — used for /feed
+    pagination so Prev/Next navigate a stable snapshot instead of re-querying
+    (which would skip articles already marked sent_at)."""
     mark_ignored()
     cutoff = age_cutoff()
     with db() as c:
-        return c.execute("""
-            SELECT id, title, source, score, url, hn_points, hn_comments, confidence FROM articles
+        rows = c.execute("""
+            SELECT id, title, source, score, url, hn_points, hn_comments,
+                   confidence, liked_at, disliked_at
+            FROM articles
             WHERE score >= ? AND sent_at IS NULL AND published >= ?
-            ORDER BY score DESC LIMIT ?
-        """, (S("MIN_SCORE"), cutoff, n)).fetchall()
+            ORDER BY score DESC
+        """, (S("MIN_SCORE"), cutoff)).fetchall()
+    return [dict(r) for r in rows]
 
 def make_article_msg(r) -> str:
     score = r['score']
@@ -946,36 +1264,27 @@ async def tg_send(send_fn, *args, retries=3, **kwargs):
                 raise
 
 async def send_digest(app):
-    rows = build_digest()
-    if not rows:
+    snapshot = digest_snapshot()
+    if not snapshot:
         return
-    global _last_digest_ids
-    _last_digest_ids = [r["id"] for r in rows]
-    await tg_send(app.bot.send_message, chat_id=TELEGRAM_CHAT_ID,
-                  text=f"📰 Your feed — {len(rows)} articles")
-    for r in rows:
-        sent = await tg_send(app.bot.send_message, chat_id=TELEGRAM_CHAT_ID,
-                             text=make_article_msg(r), parse_mode="HTML",
-                             disable_web_page_preview=True)
-        if sent:
-            with db() as c:
-                c.execute("UPDATE articles SET tg_msg_id=? WHERE id=?", (sent.message_id, r["id"]))
-    now = datetime.now(timezone.utc).isoformat()
-    with db() as c:
-        c.executemany("UPDATE articles SET sent_at=? WHERE id=?",
-                      [(now, aid) for aid in _last_digest_ids])
+    await render_feed_page(app.bot, TELEGRAM_CHAT_ID, snapshot, 0, int(S("TOP_N")))
 
 # ── search ────────────────────────────────────────────────────────────────────
 
-_search_state: dict[str, tuple[str, int, int]] = {}
+# token → (query, offset, batch, [nav_msg_id, *card_msg_ids])
+_search_state: dict[str, tuple[str, int, int, list[int]]] = {}
 _search_token: int = 0
+
+# token → (snapshot, page_size, offset, [nav_msg_id, *card_msg_ids])
+_feed_state: dict[str, tuple[list[dict], int, int, list[int]]] = {}
+_feed_token: int = 0
 
 def search_articles(query: str, limit: int, offset: int = 0) -> list[sqlite3.Row]:
     """FTS5 bm25-ranked search over title (2x weight) + summary."""
     with db() as c:
         return c.execute("""
             SELECT a.id, a.title, a.source, a.score, a.url, a.published,
-                   a.hn_points, a.hn_comments, a.confidence
+                   a.hn_points, a.hn_comments, a.confidence, a.liked_at, a.disliked_at
             FROM articles_fts f JOIN articles a ON a.rowid = f.rowid
             WHERE articles_fts MATCH ?
             ORDER BY bm25(articles_fts, 2.0, 1.0)
@@ -990,50 +1299,99 @@ def search_total(query: str) -> int:
         """, (query,)).fetchone()
     return row[0] if row else 0
 
-async def _send_search_results(update, ctx, query: str, offset: int,
-                               batch: int, edit_msg_id=None, edit_query=None):
+def normalize_search_query(query: str) -> str:
+    """Validate/rewrite a raw /search query into valid FTS5.
+
+    - Parses as-is → returned unchanged.
+    - Ends with '*' → phrase-prefix: quote the base and keep '*' *outside* the
+      quotes, so `e-graph*` matches e-graph, e-graphs, e-grapher, …
+    - Otherwise → wrapped as a quoted phrase (never errors out).
+    """
+    try:
+        search_articles(query, 1, 0)
+        return query
+    except Exception:
+        if query.rstrip().endswith("*"):
+            base = query.rstrip()[:-1].strip()
+            return f'"{base}"*'
+        return f'"{query}"'
+
+async def _delete_msgs(bot, chat_id, ids) -> None:
+    for mid in (ids or []):
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+
+async def _send_cards(bot, chat_id, rows) -> list[int]:
+    """Send article rows as individual reactable cards; record tg_msg_id and
+    re-apply the liked/disliked state as a real Telegram reaction (read fresh
+    from the DB so Prev/Next navigation reflects the latest vote)."""
+    ids = []
+    for r in rows:
+        try:
+            sent = await bot.send_message(chat_id=chat_id, text=make_article_msg(r),
+                                          parse_mode="HTML", disable_web_page_preview=True)
+        except Exception as e:
+            logging.warning(f"card send failed: {e}")
+            continue
+        ids.append(sent.message_id)
+        aid = r["id"]
+        with db() as c:
+            c.execute("UPDATE articles SET tg_msg_id=? WHERE id=?", (sent.message_id, aid))
+            st = c.execute("SELECT liked_at, disliked_at FROM articles WHERE id=?",
+                           (aid,)).fetchone()
+        emoji = None
+        if st is not None:
+            if st["liked_at"]:
+                emoji = "👍"
+            elif st["disliked_at"]:
+                emoji = "👎"
+        if emoji:
+            try:
+                await bot.set_message_reaction(chat_id=chat_id,
+                                               message_id=sent.message_id, reaction=[emoji])
+            except Exception as e:
+                logging.warning(f"reaction re-apply failed: {e}")
+    return ids
+
+async def render_search_page(update, ctx, query: str, offset: int, batch: int) -> None:
+    """Render one page of /search results as reactable cards + a nav message.
+
+    `_search_state[token] = (query, offset, batch, [nav_id, *card_ids])` tracks
+    the messages so the callback can delete them before rendering the next page."""
+    global _search_token
+    chat_id = update.effective_chat.id
+    total = search_total(query)
     rows = search_articles(query, batch, offset)
     if not rows:
-        if edit_msg_id:
-            await edit_query.answer("No more matches.")
-            await ctx.bot.edit_message_reply_markup(chat_id=update.effective_chat.id,
-                                                    message_id=edit_msg_id, reply_markup=None)
-        else:
-            await update.message.reply_text("No matches.")  # type: ignore[union-attr]
+        await ctx.bot.send_message(chat_id=chat_id, text="No matches.")
         return
-    total = search_total(query)
-    lines = [f"🔎 {total} match{'es' if total != 1 else ''} for: <code>{escape_html(query)}</code>\n"]
-    for r in rows:
-        lines.append(make_article_msg(r))
-    text = "\n".join(lines)
-    kb = None
-    has_prev = offset > 0
-    has_next = offset + len(rows) < total
-    if has_prev or has_next:
-        global _search_token
+    card_ids = await _send_cards(ctx.bot, chat_id, rows)
+
+    total_pages = max(1, (total + batch - 1) // batch)
+    cur_page = (offset // batch) + 1
+    kb_row = []
+    prev_token = next_token = None
+    if offset > 0:
         _search_token += 1
-        prev_key = f"ps:{_search_token}"
-        next_key = f"ns:{_search_token}"
-        _search_state[prev_key] = (query, offset - batch, batch)
-        _search_state[next_key] = (query, offset + batch, batch)
-        row = []
-        if has_prev:
-            row.append(InlineKeyboardButton("← Prev", callback_data=prev_key))
-        cur_page = (offset // batch) + 1
-        total_pages = max(1, (total + batch - 1) // batch)
-        row.append(InlineKeyboardButton(f"{cur_page}/{total_pages}", callback_data="none"))
-        if has_next:
-            row.append(InlineKeyboardButton("Next →", callback_data=next_key))
-        kb = InlineKeyboardMarkup([row])
-    if edit_msg_id:
-        await edit_query.answer()
-        await ctx.bot.edit_message_text(text=text, message_id=edit_msg_id,
-                                        chat_id=update.effective_chat.id,
-                                        parse_mode="HTML", reply_markup=kb,
-                                        disable_web_page_preview=True)
-    else:
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb,
-                                        disable_web_page_preview=True)  # type: ignore[union-attr]
+        prev_token = _search_token
+        kb_row.append(InlineKeyboardButton("← Prev", callback_data=f"ps:{prev_token}"))
+    kb_row.append(InlineKeyboardButton(f"{cur_page}/{total_pages}", callback_data="none"))
+    if offset + len(rows) < total:
+        _search_token += 1
+        next_token = _search_token
+        kb_row.append(InlineKeyboardButton("Next →", callback_data=f"ns:{next_token}"))
+    kb = InlineKeyboardMarkup([kb_row]) if len(kb_row) > 1 else None
+    header = (f"🔎 {total} match{'es' if total != 1 else ''} for "
+              f"<code>{escape_html(query)}</code> — page {cur_page}/{total_pages}")
+    nav = await ctx.bot.send_message(chat_id=chat_id, text=header, reply_markup=kb,
+                                     parse_mode="HTML")
+    page_msg_ids = [nav.message_id] + card_ids
+    if prev_token:
+        _search_state[f"ps:{prev_token}"] = (query, offset - batch, batch, page_msg_ids)
+    if next_token:
+        _search_state[f"ns:{next_token}"] = (query, offset + batch, batch, page_msg_ids)
 
 async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = update.message.text.split()  # type: ignore[union-attr]
@@ -1041,18 +1399,13 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("/search <query> [batch size]")  # type: ignore[union-attr]
         return
     if len(args) >= 3 and args[-1].isdigit():
-        ctx.user_data["search_batch"] = int(args[-1])
+        batch = int(args[-1])
         args = args[:-1]
+    else:
+        batch = int(S("SEARCH_BATCH"))
     query = " ".join(args[1:])
-    # validate FTS syntax; fall back to a quoted phrase on failure
-    try:
-        search_articles(query, 1, 0)
-    except Exception:
-        query = f'"{query}"'
-    batch = int(S("SEARCH_BATCH"))
-    if ctx.user_data.get("search_batch"):
-        batch = int(ctx.user_data.pop("search_batch"))
-    await _send_search_results(update, ctx, query, 0, batch)
+    query = normalize_search_query(query)
+    await render_search_page(update, ctx, query, 0, batch)
 
 async def handle_search_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1065,12 +1418,12 @@ async def handle_search_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     state = _search_state.get(q.data)
     if not state:
         await q.answer("Search session expired — run /search again.")
-        await q.edit_message_reply_markup(chat_id=update.effective_chat.id,
-                                          message_id=q.message.message_id, reply_markup=None)
         return
-    query, offset, batch = state
-    await _send_search_results(update, ctx, query, offset, batch,
-                               edit_msg_id=q.message.message_id, edit_query=q)
+    query, new_offset, batch, old_ids = state
+    _search_state.pop(q.data, None)
+    await _delete_msgs(ctx.bot, update.effective_chat.id, old_ids)
+    await render_search_page(update, ctx, query, new_offset, batch)
+    await q.answer()
 
 async def _handle_page_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1102,10 +1455,16 @@ async def daily_digest_job(app):
     await update_taste_profile()
     await send_digest(app)
 
+async def swe_refresh_job(app):
+    try:
+        await refresh_swe_scores()
+    except Exception as e:
+        logging.warning(f"SWE refresh job error: {e}")
+
 # ── command handlers ──────────────────────────────────────────────────────────
 
 async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    n = int(ctx.args[0]) if ctx.args and ctx.args[0].isdigit() else S("TOP_N")
+    n = int(ctx.args[0]) if ctx.args and ctx.args[0].isdigit() else int(S("TOP_N"))
     cutoff = age_cutoff()
     with db() as c:
         unscored = c.execute("""
@@ -1114,9 +1473,9 @@ async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               AND disliked_at IS NULL AND published >= ?
         """, (cutoff,)).fetchone()[0]
 
-    rows = build_digest(n)
+    snapshot = digest_snapshot()
 
-    if rows and unscored:
+    if snapshot and unscored:
         # show now, score in background for next time
         async def _score():
             try:
@@ -1126,7 +1485,7 @@ async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await ctx.bot.send_message(chat_id=update.effective_chat.id,  # type: ignore[union-attr]
                                                text=f"Scoring error: {e}")
         asyncio.create_task(_score())
-    elif not rows and unscored:
+    elif not snapshot and unscored:
         # nothing to show yet — wait for scoring
         await tg_send(update.message.reply_text,  # type: ignore[union-attr]
                              f"Scoring {unscored} articles (batches of {S('SCORE_BATCH')})...")
@@ -1135,27 +1494,72 @@ async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             if "429" not in str(e):
                 await update.message.reply_text(f"Scoring error: {e}")  # type: ignore[union-attr]
-        rows = build_digest(n)
+        snapshot = digest_snapshot()
 
-    if not rows:
+    if not snapshot:
         await update.message.reply_text("Nothing new above your threshold.")  # type: ignore[union-attr]
         return
 
-    global _last_digest_ids
-    _last_digest_ids = [r["id"] for r in rows]
-    await tg_send(update.message.reply_text,  # type: ignore[union-attr]
-                         f"📰 Your feed — {len(rows)} articles")
-    for r in rows:
-        sent = await tg_send(update.message.reply_text,  # type: ignore[union-attr]
-                             make_article_msg(r),
-                             parse_mode="HTML", disable_web_page_preview=True)
-        if sent:
-            with db() as c:
-                c.execute("UPDATE articles SET tg_msg_id=? WHERE id=?", (sent.message_id, r["id"]))
+    await render_feed_page(ctx.bot, update.effective_chat.id, snapshot, 0, n)
+
+async def render_feed_page(bot, chat_id: int, snapshot: list[dict], offset: int, n: int) -> None:
+    """Send one page of /feed articles as reactable cards + a nav message.
+
+    Sets sent_at on the shown page so it's consumed; Prev/Next navigate the
+    stable snapshot (not a re-query). Shared by /feed and the daily digest."""
+    global _feed_token
+    total = len(snapshot)
+    page = snapshot[offset:offset + n]
+    if not page:
+        await bot.send_message(chat_id=chat_id, text="No more articles.")
+        return
+
+    card_ids = await _send_cards(bot, chat_id, page)
+
     now = datetime.now(timezone.utc).isoformat()
     with db() as c:
         c.executemany("UPDATE articles SET sent_at=? WHERE id=?",
-                      [(now, aid) for aid in _last_digest_ids])
+                      [(now, r["id"]) for r in page])
+
+    total_pages = max(1, (total + n - 1) // n)
+    cur_page = (offset // n) + 1
+    kb_row = []
+    prev_token = next_token = None
+    if offset > 0:
+        _feed_token += 1
+        prev_token = _feed_token
+        kb_row.append(InlineKeyboardButton("← Prev", callback_data=f"fp:{prev_token}"))
+    kb_row.append(InlineKeyboardButton(f"{cur_page}/{total_pages}", callback_data="none"))
+    if offset + n < total:
+        _feed_token += 1
+        next_token = _feed_token
+        kb_row.append(InlineKeyboardButton("Next →", callback_data=f"fn:{next_token}"))
+    kb = InlineKeyboardMarkup([kb_row]) if len(kb_row) > 1 else None
+    header = f"📰 Your feed — {total} articles (page {cur_page}/{total_pages})"
+    nav = await bot.send_message(chat_id=chat_id, text=header, reply_markup=kb)
+    page_msg_ids = [nav.message_id] + card_ids
+    if prev_token:
+        _feed_state[f"fp:{prev_token}"] = (snapshot, n, offset - n, page_msg_ids)
+    if next_token:
+        _feed_state[f"fn:{next_token}"] = (snapshot, n, offset + n, page_msg_ids)
+
+async def handle_feed_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or update.effective_chat.id != TELEGRAM_CHAT_ID:
+        if q:
+            await q.answer("Unauthorized")
+        return
+    if not (q.data.startswith("fp:") or q.data.startswith("fn:")):
+        return
+    state = _feed_state.get(q.data)
+    if not state:
+        await q.answer("Feed session expired — run /feed again.")
+        return
+    snapshot, n, new_offset, old_ids = state
+    _feed_state.pop(q.data, None)
+    await _delete_msgs(ctx.bot, update.effective_chat.id, old_ids)
+    await render_feed_page(ctx.bot, update.effective_chat.id, snapshot, new_offset, n)
+    await q.answer()
 
 async def cmd_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Fetching feeds in background...")  # type: ignore[union-attr]
@@ -1252,23 +1656,158 @@ async def cmd_backend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Failed to set backend.")  # type: ignore[union-attr]
 
+def _looks_free(backend: str, model_id: str) -> bool | None:
+    """Heuristic free/paid signal. True=likely free, False=likely paid,
+    None=unknown. The only reliable suffix is Zen's '-free' convention;
+    NIM/Google expose no field, so they fall back to probe results only."""
+    m = model_id.lower()
+    if backend.lower() == "zen":
+        return m.endswith("-free")
+    return None
+
+async def _render_models_row(backend: str, model_id: str, swe: dict) -> str:
+    score = _swe_score_for(model_id, swe)
+    with db() as c:
+        row = c.execute("SELECT last_status FROM model_health WHERE backend=? AND model_id=?",
+                        (backend, model_id)).fetchone()
+    status = row["last_status"] if row else None
+    marks = {"ok": "●", "rate_limited": "◐", "gone": "✖", "down": "✖",
+             "timeout": "✖", "unknown": "·"}
+    if status:
+        mark = marks.get(status, "·")
+    else:
+        fr = _looks_free(backend, model_id)
+        if fr is False:
+            mark = "💲"          # likely paid — no probe yet
+        elif fr is True:
+            mark = "🆓"
+        else:
+            mark = "·"          # unknown (probe with /models refresh)
+    cur = "✓ " if (backend == current_llm_backend() and model_id == current_llm_model()) else ""
+    return f"{cur}{mark} {int(score)}%  <code>{escape_html(model_id)}</code> ({escape_html(backend)})"
+
+# token → (lines, page_size, offset, [nav_msg_id, content_msg_id])
+_models_state: dict[str, tuple[list[str], int, int, list[int]]] = {}
+_models_token: int = 0
+
+async def render_models_page(bot, chat_id: int, lines: list[str], offset: int, n: int) -> None:
+    """Send one page of the /models listing as a single message + a nav
+    message with Prev/Next buttons (same pattern as /search and /feed pages)."""
+    global _models_token
+    total = len(lines)
+    page = lines[offset:offset + n]
+    content = await bot.send_message(chat_id=chat_id, text="\n".join(page), parse_mode="HTML")
+
+    total_pages = max(1, (total + n - 1) // n)
+    cur_page = (offset // n) + 1
+    kb_row = []
+    prev_token = next_token = None
+    if offset > 0:
+        _models_token += 1
+        prev_token = _models_token
+        kb_row.append(InlineKeyboardButton("← Prev", callback_data=f"mp:{prev_token}"))
+    kb_row.append(InlineKeyboardButton(f"{cur_page}/{total_pages}", callback_data="none"))
+    if offset + n < total:
+        _models_token += 1
+        next_token = _models_token
+        kb_row.append(InlineKeyboardButton("Next →", callback_data=f"mn:{next_token}"))
+    kb = InlineKeyboardMarkup([kb_row]) if len(kb_row) > 1 else None
+    header_text = f"🤖 Models — page {cur_page}/{total_pages}"
+    nav = await bot.send_message(chat_id=chat_id, text=header_text, reply_markup=kb)
+    page_msg_ids = [nav.message_id, content.message_id]
+    if prev_token:
+        _models_state[f"mp:{prev_token}"] = (lines, n, offset - n, page_msg_ids)
+    if next_token:
+        _models_state[f"mn:{next_token}"] = (lines, n, offset + n, page_msg_ids)
+
+async def handle_models_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or update.effective_chat.id != TELEGRAM_CHAT_ID:
+        if q:
+            await q.answer("Unauthorized")
+        return
+    if not (q.data.startswith("mp:") or q.data.startswith("mn:")):
+        return
+    state = _models_state.get(q.data)
+    if not state:
+        await q.answer("Models list expired — run /models again.")
+        return
+    lines, n, new_offset, old_ids = state
+    _models_state.pop(q.data, None)
+    await _delete_msgs(ctx.bot, update.effective_chat.id, old_ids)
+    await render_models_page(ctx.bot, update.effective_chat.id, lines, new_offset, n)
+    await q.answer()
+
+async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = " ".join(ctx.args).strip().lower()  # type: ignore[arg-type]
+    force = args == "refresh"
+    if force:
+        await update.message.reply_text("Discovering + probing models… (may take ~1 min)")  # type: ignore[union-attr]
+
+    swe = _load_swe_scores()
+    if not swe:
+        swe = await refresh_swe_scores()
+
+    lines = [f"<b>Configured backends:</b> {', '.join(known_backends()) or 'none'}",
+             f"<b>Current:</b> {current_llm_model()} ({current_llm_backend()})",
+             f"<b>Automodel:</b> {'on' if S('AUTOMODEL_ENABLED') else 'off'}",
+             f"<i>● alive · unknown 💲 paid 🆓 free ✖ dead — probe: /models refresh</i>",
+             ""]
+    for b in known_backends():
+        ids = await discover_models(b)
+        # sort: current first, then free before paid/unknown, then by name
+        def _sort_key(mid):
+            fr = _looks_free(b, mid)
+            free_rank = 0 if fr else (1 if fr is False else 2)
+            cur = 0 if (b == current_llm_backend() and mid == current_llm_model()) else 1
+            return (cur, free_rank, mid.lower())
+        ids_sorted = sorted(ids, key=_sort_key)
+        lines.append(f"<b>{b.upper()}</b> ({len(ids)} models)")
+        if force:
+            to_probe = [m for m in ids_sorted if _looks_free(b, m) is not False]
+            sem = asyncio.Semaphore(8)
+            async def probe_one(mid):
+                async with sem:
+                    st = await probe_model(b, mid)
+                    _record_health(b, mid, st)
+            await asyncio.gather(*(probe_one(m) for m in to_probe))
+        for mid in ids_sorted:
+            lines.append("  " + await _render_models_row(b, mid, swe))
+        lines.append("")
+    await render_models_page(ctx.bot, update.effective_chat.id, lines, 0, int(S("MODELS_PER_PAGE")))
+
+async def cmd_automodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = " ".join(ctx.args).strip().lower()  # type: ignore[arg-type]
+    cur = S("AUTOMODEL_ENABLED")
+    if not args:
+        await update.message.reply_text(f"Automodel: {'on' if cur else 'off'}. Usage: /automodel on|off")  # type: ignore[union-attr]
+        return
+    if args in ("on", "1", "true", "yes"):
+        set_setting("AUTOMODEL_ENABLED", 1)
+        await update.message.reply_text("Automodel on — dead models auto-switch to a live fallback.")  # type: ignore[union-attr]
+    elif args in ("off", "0", "false", "no"):
+        set_setting("AUTOMODEL_ENABLED", 0)
+        await update.message.reply_text("Automodel off — manual /model only.")  # type: ignore[union-attr]
+    else:
+        await update.message.reply_text("Usage: /automodel on|off")  # type: ignore[union-attr]
+
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cutoff = age_cutoff()
     with db() as c:
         total     = c.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
         too_old   = c.execute("SELECT COUNT(*) FROM articles WHERE published < ?", (cutoff,)).fetchone()[0]
         recent    = total - too_old
-        r_shared  = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND shared_at IS NOT NULL", (cutoff,)).fetchone()[0]
+        r_shared  = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND liked_at IS NOT NULL", (cutoff,)).fetchone()[0]
         r_disliked= c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND disliked_at IS NOT NULL", (cutoff,)).fetchone()[0]
         r_ignored = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND ignored_at IS NOT NULL AND disliked_at IS NULL", (cutoff,)).fetchone()[0]
-        r_sent    = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NOT NULL AND shared_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL", (cutoff,)).fetchone()[0]
+        r_sent    = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NOT NULL AND liked_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL", (cutoff,)).fetchone()[0]
         r_ready   = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NULL AND score >= ? AND ignored_at IS NULL AND disliked_at IS NULL", (cutoff, S("MIN_SCORE"))).fetchone()[0]
         r_low     = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NULL AND score IS NOT NULL AND score > 0 AND score < ? AND ignored_at IS NULL AND disliked_at IS NULL", (cutoff, S("MIN_SCORE"))).fetchone()[0]
         r_unscored= c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND score IS NULL AND ignored_at IS NULL AND disliked_at IS NULL", (cutoff,)).fetchone()[0]
 
         buckets = c.execute("""
             SELECT MIN(CAST(score/10 AS INTEGER), 9) * 10 AS bucket,
-                   SUM(CASE WHEN shared_at IS NOT NULL THEN 1 ELSE 0 END) AS liked,
+                   SUM(CASE WHEN liked_at IS NOT NULL THEN 1 ELSE 0 END) AS liked,
                    SUM(CASE WHEN disliked_at IS NOT NULL THEN 1 ELSE 0 END) AS disliked
             FROM articles
             WHERE score IS NOT NULL AND published >= ?
@@ -1328,6 +1867,8 @@ async def cmd_commands(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/scoreall    — score all unscored articles\n"
         "/model NAME   — switch LLM model (persists to .env)\n"
         "/backend NAME — switch LLM backend (must be configured in .env)\n"
+        "/models       — list discovered models + SWE% + health\n"
+        "/automodel on — auto-switch to a live model when current dies\n"
         "/profile     — show your taste profile\n"
         "/remember    — update profile explicitly\n"
         "/get [KEY]   — show setting(s)\n"
@@ -1399,7 +1940,7 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
             if word.startswith("http"):
                 aid = article_id(word)
                 with db() as c:
-                    c.execute("UPDATE articles SET shared_at=? WHERE id=?",
+                    c.execute("UPDATE articles SET liked_at=? WHERE id=?",
                               (datetime.now(timezone.utc).isoformat(), aid))
                 await update.message.reply_text("✓ Liked")  # type: ignore[union-attr]
                 return
@@ -1521,7 +2062,7 @@ async def handle_reaction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if row:
             with db() as c:
                 if emoji in like_emojis:
-                    c.execute("UPDATE articles SET shared_at=NULL WHERE id=?", (row["id"],))
+                    c.execute("UPDATE articles SET liked_at=NULL WHERE id=?", (row["id"],))
                 elif emoji in dislike_emojis:
                     c.execute("UPDATE articles SET disliked_at=NULL WHERE id=?", (row["id"],))
             print(f"REACTION REMOVED: {emoji} on '{row['title']}'", flush=True)
@@ -1551,10 +2092,10 @@ async def handle_reaction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     label = ""
     with db() as c:
         if emoji in like_emojis:
-            c.execute("UPDATE articles SET shared_at=? WHERE id=?", (now, row["id"]))
+            c.execute("UPDATE articles SET liked_at=?, disliked_at=NULL WHERE id=?", (now, row["id"]))
             label = "Liked"
         else:
-            c.execute("UPDATE articles SET disliked_at=? WHERE id=?", (now, row["id"]))
+            c.execute("UPDATE articles SET disliked_at=?, liked_at=NULL WHERE id=?", (now, row["id"]))
             label = "Disliked"
     print(f"REACTION: {emoji} → {label} '{row['title']}'", flush=True)
     try:
@@ -1699,10 +2240,14 @@ def main():
     app.add_handler(CommandHandler("scoreall", cmd_scoreall,  filters=owner))
     app.add_handler(CommandHandler("model",    cmd_model,     filters=owner))
     app.add_handler(CommandHandler("backend",  cmd_backend,   filters=owner))
+    app.add_handler(CommandHandler("models",   cmd_models,    filters=owner))
+    app.add_handler(CommandHandler("automodel",cmd_automodel, filters=owner))
     app.add_handler(CommandHandler("addfeed",     cmd_addfeed,    filters=owner))
     app.add_handler(CommandHandler("removefeed",  cmd_removefeed, filters=owner))
     app.add_handler(CommandHandler("search",      cmd_search,     filters=owner))
     app.add_handler(CallbackQueryHandler(handle_search_callback, pattern=r"^(ps|ns):"))
+    app.add_handler(CallbackQueryHandler(handle_feed_callback, pattern=r"^(fp|fn):"))
+    app.add_handler(CallbackQueryHandler(handle_models_callback, pattern=r"^(mp|mn):"))
     app.add_handler(CallbackQueryHandler(_handle_page_cb, pattern=r"^none$"))
     app.add_handler(MessageReactionHandler(handle_reaction, chat_id=TELEGRAM_CHAT_ID))
     app.add_handler(MessageHandler(filters.ALL & owner, handle_message))
@@ -1717,6 +2262,8 @@ def main():
         scheduler.add_job(hourly_job, "interval", minutes=30, args=[application],
                           next_run_time=datetime.now(timezone.utc) + timedelta(seconds=phase))
         scheduler.add_job(daily_digest_job, "cron", hour=S("DIGEST_HOUR"), args=[application])
+        scheduler.add_job(swe_refresh_job, "interval", days=max(1, S("SWE_REFRESH_DAYS")),
+                          args=[application], next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30))
         scheduler.start()
         logging.info(f"Scheduler started (phase offset: {phase}s)")
         asyncio.create_task(llm_startup_check())
