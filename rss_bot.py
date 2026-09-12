@@ -90,6 +90,9 @@ SETTING_DEFAULTS = {
     "LLM_MAX_RETRIES":      "4",
     "AUTOMODEL_ENABLED":    "1",
     "SWE_REFRESH_DAYS":     "7",
+    "MODEL_PROBE_REFRESH_HOURS": "6",   # "ok" probe older than this is stale
+    "MODEL_PROBE_INTERVAL_H": "24",    # how often to proactively re-probe
+    "PROBE_BATCH":               "5",   # models probed per proactive refresh
 }
 
 # URL rewrite: feed servers that return wrong article links.
@@ -951,14 +954,69 @@ def _is_text_model(model_id: str) -> bool:
     a lucky probe never lets the fallback pick e.g. an image model for scoring."""
     return not _NON_TEXT_MODEL_RE.search(model_id)
 
+def _health_fresh(backend: str, model_id: str) -> str | None:
+    """Return last_status if it's fresh (probed within MODEL_PROBE_REFRESH_HOURS),
+    else None (stale / unknown / missing)."""
+    fresh_hours = float(S("MODEL_PROBE_REFRESH_HOURS"))
+    with db() as c:
+        row = c.execute(
+            "SELECT last_status, last_seen FROM model_health WHERE backend=? AND model_id=?",
+            (backend, model_id)).fetchone()
+    if not row:
+        return None
+    status, seen = row["last_status"], row["last_seen"]
+    try:
+        seen_dt = datetime.fromisoformat(seen)
+    except (TypeError, ValueError):
+        return None
+    if datetime.now(timezone.utc) - seen_dt > timedelta(hours=fresh_hours):
+        return None  # stale
+    return status
+
+async def probe_models_job() -> None:
+    """Proactively re-probe models so health data stays fresh, instead of only
+    probing during fallback. Refreshes stale/failed candidates first, then a
+    rotating sample of known-good ones."""
+    batch = max(1, int(S("PROBE_BATCH")))
+    with db() as c:
+        # 1) stale or failed entries — most important to refresh
+        rows = c.execute("""
+            SELECT backend, model_id, last_status, last_seen
+            FROM model_health
+            WHERE last_status != 'ok'
+            ORDER BY last_seen ASC
+        """).fetchall()
+    for row in rows[:batch]:
+        status = await probe_model(row["backend"], row["model_id"])
+        _record_health(row["backend"], row["model_id"], status)
+        logging.info(f"probe: {row['backend']}/{row['model_id']} → {status}")
+
+    # 2) rotate through fresh "ok" models to keep them verified
+    with db() as c:
+        rows = c.execute("""
+            SELECT backend, model_id FROM model_health WHERE last_status = 'ok'
+            ORDER BY last_seen ASC
+        """).fetchall()
+    if rows:
+        import hashlib as _hl
+        # offset the rotation so different instances don't collide
+        off = int(_hl.sha256(str(DB_PATH).encode()).hexdigest(), 16) % len(rows)
+        for row in (rows[off:] + rows[:off])[:batch]:
+            status = await probe_model(row["backend"], row["model_id"])
+            _record_health(row["backend"], row["model_id"], status)
+            logging.info(f"probe (rotate): {row['backend']}/{row['model_id']} → {status}")
+    logging.info(f"probe_models_job done: {batch} stale + {batch} rotating probed")
+
 async def select_fallback(current_model: str) -> tuple[str, str] | None:
     """Find the best working free model across configured backends.
 
-    Returns (backend, model_id) or None. Prefers same family, same backend,
-    then highest SWE score. Verifies availability with a live probe."""
+    Returns (backend, model_id) or None. Prefers models with a recent "ok"
+    probe (fresh health), then same family, then highest SWE score. Stale
+    "ok" entries are re-probed before being trusted."""
     swe = _load_swe_scores() or await refresh_swe_scores()
     current_backend = current_llm_backend()
-    candidates: list[tuple[float, str, str]] = []
+    # (priority, score, backend, model) — lower priority probed first
+    candidates: list[tuple[int, float, str, str]] = []
     for b in known_backends():
         models = await discover_models(b)
         for mid in models:
@@ -971,13 +1029,20 @@ async def select_fallback(current_model: str) -> tuple[str, str] | None:
                 score += 3
             if _family_token(mid) and _family_token(mid) == _family_token(current_model):
                 score += 5
-            candidates.append((score, b, mid))
-    candidates.sort(key=lambda x: -x[0])
-    for score, b, mid in candidates[:PROBE_MAX_CANDIDATES]:
+            # priority 0 = fresh ok (recent known-good), 1 = everything else
+            health = _health_fresh(b, mid)
+            priority = 0 if health == "ok" else 1
+            candidates.append((priority, score, b, mid))
+    candidates.sort(key=lambda x: (x[0], -x[1]))
+    # probe in order: fresh-known-good first, then re-verify others
+    for priority, score, b, mid in candidates[:PROBE_MAX_CANDIDATES]:
+        health = _health_fresh(b, mid)
+        # trust a fresh "ok" only if the backend/key look right — re-probe anyway
+        # for a cheap liveness confirm (we're in a crisis; be safe)
         status = await probe_model(b, mid)
         _record_health(b, mid, status)
         if status in ("ok", "rate_limited"):
-            logging.info(f"Fallback selected: {mid} ({b}) — score {score:.0f}")
+            logging.info(f"Fallback selected: {mid} ({b}) — score {score:.0f} (was {health})")
             return b, mid
     return None
 
@@ -2264,6 +2329,8 @@ def main():
         scheduler.add_job(daily_digest_job, "cron", hour=S("DIGEST_HOUR"), args=[application])
         scheduler.add_job(swe_refresh_job, "interval", days=max(1, S("SWE_REFRESH_DAYS")),
                           args=[application], next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30))
+        scheduler.add_job(probe_models_job, "interval", hours=max(1, S("MODEL_PROBE_INTERVAL_H")),
+                          next_run_time=datetime.now(timezone.utc) + timedelta(seconds=60))
         scheduler.start()
         logging.info(f"Scheduler started (phase offset: {phase}s)")
         asyncio.create_task(llm_startup_check())

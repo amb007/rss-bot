@@ -325,4 +325,26 @@ for k in ["TEST_REAL", "TEST_ALIAS", "TEST_CHAIN", "TEST_MISSING"]:
     _os.environ.pop(k, None)
 print("env: prefix resolution OK")
 
+# _health_fresh: fresh "ok" is trusted, stale "ok" is not
+_dt = __import__("datetime").datetime
+_tz = __import__("datetime").timezone
+_td = __import__("datetime").timedelta
+from pathlib import Path as _P
+import sqlite3 as _sq
+_conn = _sq.connect(str(tmp / "rss_bot.db"))
+_conn.execute("DELETE FROM model_health WHERE backend='test'")
+_conn.commit()
+# fresh entry (now)
+_conn.execute("INSERT INTO model_health (backend, model_id, last_status, last_seen) VALUES (?,?,?,?)",
+              ("test", "fresh-model", "ok", _dt.now(_tz.utc).isoformat()))
+# stale entry (30h ago)
+_conn.execute("INSERT INTO model_health (backend, model_id, last_status, last_seen) VALUES (?,?,?,?)",
+              ("test", "stale-model", "ok", (_dt.now(_tz.utc) - _td(hours=30)).isoformat()))
+_conn.commit()
+_conn.close()
+assert r._health_fresh("test", "fresh-model") == "ok", "fresh ok not trusted"
+assert r._health_fresh("test", "stale-model") is None, "stale ok wrongly trusted"
+assert r._health_fresh("test", "missing-model") is None, "missing should be None"
+print("_health_fresh staleness OK")
+
 print("ALL TESTS PASSED")

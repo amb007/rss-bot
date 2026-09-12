@@ -131,9 +131,13 @@ times out/5xx) and `AUTOMODEL_ENABLED` is on, the bot:
 2. Filters out non-text models (image/tts/embedding/…) — they can pass a probe
    but can't score articles,
 3. Probes each candidate's `/chat/completions` to verify it actually serves,
-4. Ranks working candidates by **SWE-bench** coding score (fetched live from
-   swebench.com, cached weekly) × same-family × same-backend,
-5. Switches to the best working model via `/model`-equivalent persistence, and
+4. **Prioritizes models with a recent successful probe** — a fresh `ok` entry in
+   the `model_health` table is tried before untested/unknown candidates,
+5. Re-probes stale "ok" entries (older than `MODEL_PROBE_REFRESH_HOURS`) before
+   trusting them — a model that worked 5 days ago is not assumed to still work,
+6. Ranks the remaining working candidates by **SWE-bench** coding score (fetched
+   live from swebench.com, cached weekly) × same-family × same-backend,
+7. Switches to the best working model via `/model`-equivalent persistence, and
    notifies the owner in Telegram.
 
 A **429 storm** (the free-tier rate limit that never resolves, e.g. a model
@@ -141,9 +145,22 @@ whose quota is exhausted) also triggers fallback: after
 `_429_STORM_LIMIT` consecutive retry-exhausted 429 calls, the model is treated
 as degraded and switched away from.
 
+**Proactive probing** — besides reacting to failures, a periodic job
+(`probe_models_job`, every `MODEL_PROBE_INTERVAL_H` hours) refreshes `model_health`
+so availability data stays fresh. It first re-probes stale/failed models, then
+rotates through a sample of known-good ones (`PROBE_BATCH` at a time). This means
+a model that recovers (e.g. its rate limit resets) gets noticed and re-added to
+the pool without waiting for the next failure.
+
 `/models` lists discovered models with their SWE% and last-probe health;
 `/models refresh` forces a rediscovery + probe. There's no static model list —
 availability is always verified on demand, since provider catalogs churn.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `MODEL_PROBE_REFRESH_HOURS` | `6` | An "ok" probe older than this is treated as stale and re-verified |
+| `MODEL_PROBE_INTERVAL_H` | `24` | How often the proactive re-probe job runs |
+| `PROBE_BATCH` | `5` | Models re-probed per proactive refresh cycle |
 
 ---
 
