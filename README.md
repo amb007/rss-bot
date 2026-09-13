@@ -9,11 +9,15 @@ The example installation below hosts two live instances; adding a third
 friend/bot is a ~10-minute copy-paste job. This file walks you through the
 whole thing.
 
-<image src="images/feed.jpg" width="200"/>
-<image src="images/search.jpg" width="200"/>
-<image src="images/stats.jpg" width="200"/>
-<image src="images/models.jpg" width="200"/>
-<image src="images/commands.jpg" width="200"/>
+<table>
+  <tr>
+    <td valign="bottom"><img src="images/feed.jpg" width="200"/></td>
+    <td valign="bottom"><img src="images/search.jpg" width="200"/></td>
+    <td valign="bottom"><img src="images/stats.jpg" width="200"/></td>
+    <td valign="bottom"><img src="images/models.jpg" width="200"/></td>
+    <td valign="bottom"><img src="images/commands.jpg" width="200"/></td>
+  </tr>
+</table>
 
 ---
 
