@@ -85,7 +85,7 @@ SETTING_DEFAULTS = {
     "ARTICLE_MAX_AGE_DAYS": "7",
     "IGNORE_SCORE_FLOOR":   "80",
     "SEARCH_BATCH":         "8",
-    "MODELS_PER_PAGE":      "15",
+    "MODELS_PER_PAGE":      "10",
     "LLM_MIN_INTERVAL":     "3",
     "LLM_MAX_RETRIES":      "4",
     "AUTOMODEL_ENABLED":    "1",
@@ -1723,67 +1723,124 @@ async def cmd_backend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def _looks_free(backend: str, model_id: str) -> bool | None:
     """Heuristic free/paid signal. True=likely free, False=likely paid,
-    None=unknown. The only reliable suffix is Zen's '-free' convention;
-    NIM/Google expose no field, so they fall back to probe results only."""
+    None=unknown. Zen has a reliable '-free' suffix; Goo's free tier is the
+    flash/embedding/gemma family on AI Studio; NIM exposes no field."""
     m = model_id.lower()
     if backend.lower() == "zen":
         return m.endswith("-free")
+    if backend.lower() == "goo":
+        # Paid / rate-limited-only: pro, image/video/audio gen, robotics, etc.
+        if any(k in m for k in ("pro", "image", "tts", "audio", "video", "veo",
+                                "lyria", "nano", "robotics", "computer-use",
+                                "transcribe", "live", "antigravity",
+                                "deep-research", "aqa", "omni")):
+            return False
+        # AI Studio free tier: flash / flash-lite / embedding / gemma.
+        if any(k in m for k in ("flash-lite", "flash")):
+            return True
+        if any(k in m for k in ("embedding", "gemma")):
+            return True
+        return None
     return None
 
-async def _render_models_row(backend: str, model_id: str, swe: dict) -> str:
-    score = _swe_score_for(model_id, swe)
+# /models browsing state.
+# nav token → (providers, provider_idx, model_offset, page_size, [nav_msg_id, content_msg_id])
+# where providers = list of (backend, [model_id, ...]) — one sorted model list per backend.
+_models_state: dict[str, tuple[list[tuple[str, list[str]]], int, int, int, list[int]]] = {}
+# model-pick token → (backend, model_id)
+_models_pick: dict[str, tuple[str, str]] = {}
+_models_token: int = 0
+
+def _prov_short(backend: str) -> str:
+    """3-letter provider shortcut for nav buttons."""
+    return {"llamacpp": "LCP", "nim": "NIM", "goo": "GOO", "zen": "ZEN"}.get(
+        backend, backend.upper()[:3])
+
+def _model_status_mark(backend: str, model_id: str) -> str:
+    """Status marker for a model: ● alive, · unknown, x dead (monochrome)."""
     with db() as c:
         row = c.execute("SELECT last_status FROM model_health WHERE backend=? AND model_id=?",
                         (backend, model_id)).fetchone()
     status = row["last_status"] if row else None
-    marks = {"ok": "●", "rate_limited": "◐", "gone": "✖", "down": "✖",
-             "timeout": "✖", "unknown": "·"}
-    if status:
-        mark = marks.get(status, "·")
-    else:
-        fr = _looks_free(backend, model_id)
-        if fr is False:
-            mark = "💲"          # likely paid — no probe yet
-        elif fr is True:
-            mark = "🆓"
-        else:
-            mark = "·"          # unknown (probe with /models refresh)
+    if status in ("ok", "rate_limited"):
+        return "●"
+    if status == "unknown":
+        return "·"
+    return "x"
+
+def _model_button_text(backend: str, model_id: str, swe: dict) -> str:
+    """Plain-text label for a model row (Telegram buttons don't take HTML)."""
+    score = _swe_score_for(model_id, swe)
+    fr = _looks_free(backend, model_id)
     cur = "✓ " if (backend == current_llm_backend() and model_id == current_llm_model()) else ""
-    return f"{cur}{mark} {int(score)}%  <code>{escape_html(model_id)}</code> ({escape_html(backend)})"
 
-# token → (lines, page_size, offset, [nav_msg_id, content_msg_id])
-_models_state: dict[str, tuple[list[str], int, int, list[int]]] = {}
-_models_token: int = 0
+    parts = [cur] if cur else []
+    parts.append(_model_status_mark(backend, model_id))
+    parts.append("\u262e\ufe0e" if fr is True else ("$" if fr is False else "?"))
+    return f"{' '.join(parts)} {int(score)}% {model_id}"
 
-async def render_models_page(bot, chat_id: int, lines: list[str], offset: int, n: int) -> None:
-    """Send one page of the /models listing as a single message + a nav
-    message with Prev/Next buttons (same pattern as /search and /feed pages)."""
+async def render_models_page(bot, chat_id: int, providers: list[tuple[str, list[str]]],
+                             pidx: int, moff: int, n: int, swe: dict) -> None:
+    """Send one provider's model page: a content message whose keyboard is the
+    models (tap = /model), plus a nav message with provider + model paging."""
     global _models_token
-    total = len(lines)
-    page = lines[offset:offset + n]
-    content = await bot.send_message(chat_id=chat_id, text="\n".join(page), parse_mode="HTML")
+    total_p = len(providers)
+    if pidx < 0:
+        pidx = total_p - 1
+    elif pidx >= total_p:
+        pidx = 0
+    backend, models = providers[pidx]
+    n_models = len(models)
+    total_pages = max(1, (n_models + n - 1) // n)
+    cur_page = (moff // n) + 1
+    page = models[moff:moff + n]
 
-    total_pages = max(1, (total + n - 1) // n)
-    cur_page = (offset // n) + 1
-    kb_row = []
-    prev_token = next_token = None
-    if offset > 0:
+    # content message: one button per model row → select that model
+    kb = []
+    for mid in page:
         _models_token += 1
-        prev_token = _models_token
-        kb_row.append(InlineKeyboardButton("← Prev", callback_data=f"mp:{prev_token}"))
-    kb_row.append(InlineKeyboardButton(f"{cur_page}/{total_pages}", callback_data="none"))
-    if offset + n < total:
+        tok = f"ms:{_models_token}"
+        _models_pick[tok] = (backend, mid)
+        kb.append([InlineKeyboardButton(_model_button_text(backend, mid, swe),
+                                        callback_data=tok)])
+
+    # content: model buttons with legend header
+    content = await bot.send_message(chat_id=chat_id,
+                                     text="● alive · unknown x dead | ☮ free $ paid ? unknown | SWE score — tap a model to use it",
+                                     reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+    nav_row = []
+    prev_p = next_p = prev_m = next_m = None
+    if total_p > 1:
         _models_token += 1
-        next_token = _models_token
-        kb_row.append(InlineKeyboardButton("Next →", callback_data=f"mn:{next_token}"))
-    kb = InlineKeyboardMarkup([kb_row]) if len(kb_row) > 1 else None
-    header_text = f"🤖 Models — page {cur_page}/{total_pages}"
-    nav = await bot.send_message(chat_id=chat_id, text=header_text, reply_markup=kb)
+        prev_p = f"mp:{_models_token}"
+        nav_row.append(InlineKeyboardButton(
+            f"← {_prov_short(providers[(pidx-1) % total_p][0])}", callback_data=prev_p))
+    if moff > 0:
+        _models_token += 1
+        prev_m = f"ml:{_models_token}"
+        nav_row.append(InlineKeyboardButton("← Prev", callback_data=prev_m))
+    nav_row.append(InlineKeyboardButton(f"{cur_page}/{total_pages}", callback_data="none"))
+    if moff + n < n_models:
+        _models_token += 1
+        next_m = f"mr:{_models_token}"
+        nav_row.append(InlineKeyboardButton("Next →", callback_data=next_m))
+    if total_p > 1:
+        _models_token += 1
+        next_p = f"mn:{_models_token}"
+        nav_row.append(InlineKeyboardButton(
+            f"{_prov_short(providers[(pidx+1) % total_p][0])} →", callback_data=next_p))
+    nav_text = f"<b>{backend.upper()}</b> — {n_models} models (page {cur_page}/{total_pages})"
+    nav = await bot.send_message(chat_id=chat_id, text=nav_text, parse_mode="HTML",
+                                 reply_markup=InlineKeyboardMarkup([nav_row]))
     page_msg_ids = [nav.message_id, content.message_id]
-    if prev_token:
-        _models_state[f"mp:{prev_token}"] = (lines, n, offset - n, page_msg_ids)
-    if next_token:
-        _models_state[f"mn:{next_token}"] = (lines, n, offset + n, page_msg_ids)
+    if prev_p:
+        _models_state[prev_p] = (providers, pidx - 1, 0, n, page_msg_ids)
+    if next_p:
+        _models_state[next_p] = (providers, pidx + 1, 0, n, page_msg_ids)
+    if prev_m:
+        _models_state[prev_m] = (providers, pidx, moff - n, n, page_msg_ids)
+    if next_m:
+        _models_state[next_m] = (providers, pidx, moff + n, n, page_msg_ids)
 
 async def handle_models_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1791,16 +1848,32 @@ async def handle_models_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         if q:
             await q.answer("Unauthorized")
         return
-    if not (q.data.startswith("mp:") or q.data.startswith("mn:")):
+    data = q.data
+    # model selection → equivalent to /model <id> (switch backend too)
+    if data.startswith("ms:"):
+        pick = _models_pick.get(data)
+        if not pick:
+            await q.answer("Expired — run /models again.")
+            return
+        backend, mid = pick
+        if backend != current_llm_backend():
+            set_llm_backend(backend)
+        set_llm_model(mid)
+        logging.info(f"/models pick → {mid} ({backend})")
+        await q.answer(f"Using {mid} ({backend})")
         return
-    state = _models_state.get(q.data)
+    if not (data.startswith("mp:") or data.startswith("mn:") or
+            data.startswith("ml:") or data.startswith("mr:")):
+        return
+    state = _models_state.get(data)
     if not state:
         await q.answer("Models list expired — run /models again.")
         return
-    lines, n, new_offset, old_ids = state
-    _models_state.pop(q.data, None)
+    providers, new_pidx, new_moff, n, old_ids = state
+    _models_state.pop(data, None)
+    swe = _load_swe_scores() or {}
     await _delete_msgs(ctx.bot, update.effective_chat.id, old_ids)
-    await render_models_page(ctx.bot, update.effective_chat.id, lines, new_offset, n)
+    await render_models_page(ctx.bot, update.effective_chat.id, providers, new_pidx, new_moff, n, swe)
     await q.answer()
 
 async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1813,21 +1886,21 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not swe:
         swe = await refresh_swe_scores()
 
-    lines = [f"<b>Configured backends:</b> {', '.join(known_backends()) or 'none'}",
-             f"<b>Current:</b> {current_llm_model()} ({current_llm_backend()})",
-             f"<b>Automodel:</b> {'on' if S('AUTOMODEL_ENABLED') else 'off'}",
-             f"<i>● alive · unknown 💲 paid 🆓 free ✖ dead — probe: /models refresh</i>",
-             ""]
+    providers: list[tuple[str, list[str]]] = []
     for b in known_backends():
         ids = await discover_models(b)
-        # sort: current first, then free before paid/unknown, then by name
-        def _sort_key(mid):
-            fr = _looks_free(b, mid)
-            free_rank = 0 if fr else (1 if fr is False else 2)
+        # sort: current first, alive, free, unknown, dead, SWE desc, name
+        def _sort_key(mid: str, b=b):
+            with db() as c:
+                row = c.execute("SELECT last_status FROM model_health WHERE backend=? AND model_id=?",
+                                (b, mid)).fetchone()
+            status = row["last_status"] if row else None
+            status_cat = 0 if status in ("ok", "rate_limited") else \
+                         (1 if status == "unknown" else 2)
             cur = 0 if (b == current_llm_backend() and mid == current_llm_model()) else 1
-            return (cur, free_rank, mid.lower())
+            free = _looks_free(b, mid) is True
+            return (cur, status_cat, not free, -_swe_score_for(mid, swe), mid.lower())
         ids_sorted = sorted(ids, key=_sort_key)
-        lines.append(f"<b>{b.upper()}</b> ({len(ids)} models)")
         if force:
             to_probe = [m for m in ids_sorted if _looks_free(b, m) is not False]
             sem = asyncio.Semaphore(8)
@@ -1836,10 +1909,12 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     st = await probe_model(b, mid)
                     _record_health(b, mid, st)
             await asyncio.gather(*(probe_one(m) for m in to_probe))
-        for mid in ids_sorted:
-            lines.append("  " + await _render_models_row(b, mid, swe))
-        lines.append("")
-    await render_models_page(ctx.bot, update.effective_chat.id, lines, 0, int(S("MODELS_PER_PAGE")))
+        providers.append((b, ids_sorted))
+    if not providers:
+        await update.message.reply_text("No configured backends — set <BACKEND>_BASE_URL in .env")  # type: ignore[union-attr]
+        return
+    await render_models_page(ctx.bot, update.effective_chat.id, providers, 0, 0,
+                             int(S("MODELS_PER_PAGE")), swe)
 
 async def cmd_automodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = " ".join(ctx.args).strip().lower()  # type: ignore[arg-type]
@@ -2312,7 +2387,7 @@ def main():
     app.add_handler(CommandHandler("search",      cmd_search,     filters=owner))
     app.add_handler(CallbackQueryHandler(handle_search_callback, pattern=r"^(ps|ns):"))
     app.add_handler(CallbackQueryHandler(handle_feed_callback, pattern=r"^(fp|fn):"))
-    app.add_handler(CallbackQueryHandler(handle_models_callback, pattern=r"^(mp|mn):"))
+    app.add_handler(CallbackQueryHandler(handle_models_callback, pattern=r"^(ms|mp|mn|ml|mr):"))
     app.add_handler(CallbackQueryHandler(_handle_page_cb, pattern=r"^none$"))
     app.add_handler(MessageReactionHandler(handle_reaction, chat_id=TELEGRAM_CHAT_ID))
     app.add_handler(MessageHandler(filters.ALL & owner, handle_message))

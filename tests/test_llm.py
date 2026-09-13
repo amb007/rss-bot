@@ -347,4 +347,33 @@ assert r._health_fresh("test", "stale-model") is None, "stale ok wrongly trusted
 assert r._health_fresh("test", "missing-model") is None, "missing should be None"
 print("_health_fresh staleness OK")
 
+# /models provider shortcut + model button text
+assert r._prov_short("nim") == "NIM"
+assert r._prov_short("goo") == "GOO"
+assert r._prov_short("zen") == "ZEN"
+assert r._prov_short("llamacpp") == "LCP"
+assert r._prov_short("weird") == "WEI"
+print("_prov_short OK")
+
+btn = r._model_button_text("nim", "meta/llama-3.1-8b-instruct", {})
+assert "meta/llama-3.1-8b-instruct" in btn
+assert btn.count("%") == 1
+# unknown free/paid → "?" placeholder (nim has no free flag)
+assert " ? " in btn or btn.startswith("? ") or btn.endswith("? ") or " ?" in btn
+# starts with a leading mark (✓/●/·/x/?)
+assert btn.split(" ")[0] in ("✓", "●", "·", "x", "?", "free", "$") or btn.startswith("✓ ")
+
+# zen -free suffix → ☮ (peace symbol) free marker
+btnz = r._model_button_text("zen", "deepseek-v4-flash-free", {})
+assert "\u262e" in btnz
+assert "$" not in btnz
+
+# goo: flash-lite free, pro paid, flash-image paid
+assert r._looks_free("goo", "gemini-3.1-flash-lite-preview") is True
+assert r._looks_free("goo", "gemini-flash-latest") is True
+assert r._looks_free("goo", "gemini-3.1-pro-preview") is False
+assert r._looks_free("goo", "gemini-2.5-flash-image") is False
+assert r._looks_free("nim", "meta/llama-3.1-8b-instruct") is None
+print("_model_button_text OK:", btn[:40], "| zen:", btnz[:40])
+
 print("ALL TESTS PASSED")

@@ -9,6 +9,12 @@ The example installation below hosts two live instances; adding a third
 friend/bot is a ~10-minute copy-paste job. This file walks you through the
 whole thing.
 
+<image src="images/feed.jpg" width="200"/>
+<image src="images/search.jpg" width="200"/>
+<image src="images/stats.jpg" width="200"/>
+<image src="images/models.jpg" width="200"/>
+<image src="images/commands.jpg" width="200"/>
+
 ---
 
 ## Layout
@@ -152,7 +158,10 @@ rotates through a sample of known-good ones (`PROBE_BATCH` at a time). This mean
 a model that recovers (e.g. its rate limit resets) gets noticed and re-added to
 the pool without waiting for the next failure.
 
-`/models` lists discovered models with their SWE% and last-probe health;
+`/models` lists discovered models grouped **per provider**, with one provider
+per screen: tap a model row to use it (equivalent to `/model <name>`, switching
+backend too). Navigate providers with the `← NIM / GOO →` shortcuts and page
+within a provider with `← Prev` / `Next →` (`MODELS_PER_PAGE` rows per page).
 `/models refresh` forces a rediscovery + probe. There's no static model list —
 availability is always verified on demand, since provider catalogs churn.
 
