@@ -77,6 +77,7 @@ def instance_phase_offset_seconds() -> int:
 
 SETTING_DEFAULTS = {
     "DIGEST_HOUR":          "8",
+    "DIGEST_TOP":           "8",
     "IGNORE_AFTER_H":       "12",
     "TOP_N":                "8",
     "MIN_SCORE":            "10",
@@ -1328,11 +1329,86 @@ async def tg_send(send_fn, *args, retries=3, **kwargs):
             else:
                 raise
 
-async def send_digest(app):
-    snapshot = digest_snapshot()
-    if not snapshot:
-        return
-    await render_feed_page(app.bot, TELEGRAM_CHAT_ID, snapshot, 0, int(S("TOP_N")))
+def digest_pool() -> list[dict]:
+    """Articles eligible for a digest: new (published after the last digest)
+    and not yet shown anywhere (sent_at IS NULL, i.e. not read via /feed and
+    not in a prior digest)."""
+    last = None
+    with db() as c:
+        row = c.execute("SELECT value FROM settings WHERE key='last_digest'").fetchone()
+        if row:
+            last = row["value"]
+    since = last if last else age_cutoff()
+    with db() as c:
+        rows = c.execute("""
+            SELECT id, title, source, score, url, hn_points, hn_comments
+            FROM articles
+            WHERE score >= ? AND sent_at IS NULL AND published > ?
+            ORDER BY score DESC
+        """, (S("MIN_SCORE"), since)).fetchall()
+    return [dict(r) for r in rows]
+
+def _digest_hn(r) -> int:
+    return (r.get("hn_points") or 0) + (r.get("hn_comments") or 0)
+
+def group_digest(pool: list[dict], budget: int = 8):
+    """Split the digest pool into (top_picks, discussed, skim) sections.
+    Top picks = highest score; discussed = most HN-active; the rest skim.
+    Never returns more than `budget` rows total."""
+    top = pool[:4]
+    top_ids = {r["id"] for r in top}
+    rest = [r for r in pool if r["id"] not in top_ids]
+    with_hn = [r for r in rest if _digest_hn(r) > 0]
+    discussed = sorted(with_hn, key=_digest_hn, reverse=True)[:3]
+    disc_ids = {r["id"] for r in discussed}
+    skim = [r for r in rest if r["id"] not in disc_ids][:max(0, budget - len(top) - len(discussed))]
+    return top, discussed, skim
+
+def render_digest_message(top, discussed, skim, total: int) -> str:
+    day = datetime.now(timezone.utc).strftime("%a %d %b")
+    lines = [f"📰 Daily Digest · {day}", ""]
+    def _item(r, num):
+        title = escape_html(r["title"] or r["url"])
+        source = escape_html(r["source"] or "")
+        hn = ""
+        if _digest_hn(r):
+            parts = [p for p in ((f"{r['hn_points']} pts" if r.get("hn_points") else None),
+                                 (f"{r['hn_comments']} cmts" if r.get("hn_comments") else None)) if p]
+            hn = f" <i>({', '.join(parts)})</i>"
+        return f"{num}. <a href=\"{r['url']}\">{title}</a> — {source}{hn}"
+    num = 0
+    for label, rows in (("🔥 <b>Top picks</b>", top),
+                        ("💬 <b>Most discussed</b>", discussed),
+                        ("📚 <b>Worth a skim</b>", skim)):
+        if not rows:
+            continue
+        lines.append(label)
+        for r in rows:
+            num += 1
+            lines.append(_item(r, num))
+        lines.append("")
+    shown = len(top) + len(discussed) + len(skim)
+    tail = f"· {total} new article{'s' if total != 1 else ''}"
+    tail += " · 👍/👎 on /feed refines your profile"
+    lines.append(tail)
+    return "\n".join(lines)
+
+async def send_digest(bot, chat_id: int) -> int:
+    """Send one compact grouped digest message and advance the digest window.
+    Articles are NOT marked sent_at, so they stay in /feed where the user can
+    react to them. Returns how many articles were shown (0 = nothing new)."""
+    pool = digest_pool()
+    if not pool:
+        return 0
+    top, discussed, skim = group_digest(pool, budget=int(S("DIGEST_TOP")))
+    shown = top + discussed + skim
+    await tg_send(bot.send_message, chat_id=chat_id,
+                  text=render_digest_message(top, discussed, skim, len(pool)),
+                  parse_mode="HTML", disable_web_page_preview=True)
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_digest', ?)", (now,))
+    return len(shown)
 
 # ── search ────────────────────────────────────────────────────────────────────
 
@@ -1518,7 +1594,7 @@ async def hourly_job(app):
 async def daily_digest_job(app):
     mark_ignored()
     await update_taste_profile()
-    await send_digest(app)
+    await send_digest(app.bot, TELEGRAM_CHAT_ID)
 
 async def swe_refresh_job(app):
     try:
@@ -1566,6 +1642,11 @@ async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await render_feed_page(ctx.bot, update.effective_chat.id, snapshot, 0, n)
+
+async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    sent = await send_digest(ctx.bot, update.effective_chat.id)  # type: ignore[union-attr]
+    if not sent:
+        await update.message.reply_text("Nothing new since your last digest.")  # type: ignore[union-attr]
 
 async def render_feed_page(bot, chat_id: int, snapshot: list[dict], offset: int, n: int) -> None:
     """Send one page of /feed articles as reactable cards + a nav message.
@@ -2003,6 +2084,7 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_commands(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(  # type: ignore[union-attr]
         f"/feed [n]    — scored digest (default {S('TOP_N')})\n"
+        f"/digest      — compact daily digest (new + unseen)\n"
         "/fetch       — fetch new articles from feeds\n"
         "/scoreall    — score all unscored articles\n"
         "/model NAME   — switch LLM model (persists to .env)\n"
@@ -2370,6 +2452,7 @@ def main():
     owner = filters.Chat(chat_id=TELEGRAM_CHAT_ID)
     app.add_handler(CommandHandler("start",    cmd_start,     filters=owner))
     app.add_handler(CommandHandler("feed",     cmd_feed,      filters=owner))
+    app.add_handler(CommandHandler("digest",   cmd_digest,    filters=owner))
     app.add_handler(CommandHandler("fetch",    cmd_fetch,     filters=owner))
     app.add_handler(CommandHandler("profile",  cmd_profile,   filters=owner))
     app.add_handler(CommandHandler("remember", cmd_remember,  filters=owner))

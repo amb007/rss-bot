@@ -117,7 +117,8 @@ app.add_handler(MessageReactionHandler(handle_reaction, chat_id=TELEGRAM_CHAT_ID
 | `SEARXNG_URL` | `http://host.local:8888` | Local SearXNG instance used for `/search` |
 | `DIGEST_HOUR` | `8` | Hour of day to push the daily digest (24h) |
 | `IGNORE_AFTER_H` | `12` | Article age (h) before it's ignored by the digest |
-| `TOP_N` | `30` | Max articles in the daily digest |
+| `TOP_N` | `8` | Max articles shown in `/feed` |
+| `DIGEST_TOP` | `8` | Max articles shown in the daily digest message |
 | `MIN_SCORE` | `10` | Minimum LLM score for a "keep" article |
 | `PROFILE_EXAMPLES` | `30` | Number of saved-article examples used to derive the interest profile |
 | `SCORE_BATCH` | `10` | Articles scored per LLM batch |
@@ -183,9 +184,14 @@ Runs on a scheduler inside the same process (APScheduler):
 
 1. `hourly_job` — every 30 min: fetch all feeds in `feeds.txt`, insert unseen
    articles, then `score_unscored()` (LLM-scored, batched per `SCORE_BATCH`).
-2. `daily_digest_job` — at `DIGEST_HOUR`: select fresh articles above
-   `MIN_SCORE`, dedupe against an interest profile, and push to
-   `TELEGRAM_CHAT_ID` through `send_digest()`.
+2. `daily_digest_job` (and `/digest`) — at `DIGEST_HOUR` select *new + unseen*
+   articles (`score >= MIN_SCORE`, not yet `sent_at`, published after the last
+   digest) and push a compact grouped message to `TELEGRAM_CHAT_ID` through
+   `send_digest()`. It renders one message grouped into **🔥 Top picks**,
+   **💬 Most discussed** (by HN votes), and **📚 Worth a skim**, capped at
+   `DIGEST_TOP`. Shown articles stay unread (no `sent_at` set), so you can still
+   👍/👎 them in `/feed`; the digest window advances via the `last_digest`
+   setting so nothing is re-offered next run.
 3. Errors during the hourly job are pushed straight to the owner's chat.
 
 The scraper, scoring, and search are all local — no cloud LLM needed if you
@@ -200,6 +206,7 @@ point `<BACKEND>_BASE_URL` (e.g. `LLAMACPP_BASE_URL`) at a local
 |---|---|
 | `/start` | Hello + bot commands |
 | `/feed` | Get the current pending feed (fresh scored articles) |
+| `/digest` | Push the compact daily digest now (new + unseen articles) |
 | `/fetch` | Force a feed fetch + scoring cycle |
 | `/profile` | Show the current saved-articles interest profile |
 | `/remember` / `/get` / `/set` | Save / look up / change settings and profile |

@@ -376,4 +376,77 @@ assert r._looks_free("goo", "gemini-2.5-flash-image") is False
 assert r._looks_free("nim", "meta/llama-3.1-8b-instruct") is None
 print("_model_button_text OK:", btn[:40], "| zen:", btnz[:40])
 
+# --- digest: group_digest splits into sections within budget ---
+def _mk(rid, score, hnpts=0, hncmts=0):
+    return {"id": rid, "title": f"t{rid}", "source": "s", "score": score,
+            "url": f"u{rid}", "hn_points": hnpts, "hn_comments": hncmts}
+
+# 12 items: top 4 by score = id descending (score 12..1), rest have HN signal
+pool = [_mk(i, score=i, hnpts=i, hncmts=i) for i in range(12, 0, -1)]
+top, disc, skim = r.group_digest(pool, budget=8)
+assert [x['id'] for x in top] == [12, 11, 10, 9], [x['id'] for x in top]
+assert [x['id'] for x in disc] == [8, 7, 6], [x['id'] for x in disc]
+assert [x['id'] for x in skim] == [5], [x['id'] for x in skim]
+assert len(top) + len(disc) + len(skim) <= 8
+print("group_digest split OK")
+
+# discussed section only picks the most HN-active among the non-top rest
+mixed = [_mk(1, score=1, hnpts=99, hncmts=99), _mk(2, score=2, hnpts=0, hncmts=0),
+         _mk(3, score=3, hnpts=5, hncmts=0), _mk(4, score=4, hnpts=0, hncmts=0),
+         _mk(5, score=5, hnpts=10, hncmts=0), _mk(6, score=6, hnpts=1, hncmts=0)]
+mixed.sort(key=lambda x: x['score'], reverse=True)  # digest_pool orders score-desc
+top2, disc2, skim2 = r.group_digest(mixed, budget=8)
+assert [x['id'] for x in top2] == [6, 5, 4, 3]
+assert [x['id'] for x in disc2] == [1], [x['id'] for x in disc2]  # only HN-active, most = id1
+print("group_digest discussed (HN-ranked only) OK")
+
+# no-HN pool → discussed empty, skim fills the rest
+plain = [_mk(i, score=i, hnpts=0, hncmts=0) for i in range(10, 0, -1)]
+top3, disc3, skim3 = r.group_digest(plain, budget=8)
+assert disc3 == []
+assert len(top3) + len(skim3) == 8
+print("group_digest no-HN OK")
+
+# render_digest_message: sections + numbering + footer + HTML escaped
+msg = r.render_digest_message(top, disc, skim, total=12)
+assert "🔥 <b>Top picks</b>" in msg
+assert "💬 <b>Most discussed</b>" in msg
+assert "📚 <b>Worth a skim</b>" in msg
+assert "1. " in msg and "5. " in msg
+assert "more in /feed" not in msg
+# digest message no longer boasts about unshown ones (shown==total here)
+
+# escaped title with markup
+escaped_pool = [_mk("x", 10, 0, 0)]
+escaped_pool[0]["title"] = "A <b>bold</b> & ampersand"
+t, d, s = r.group_digest(escaped_pool, budget=8)
+emsg = r.render_digest_message(t, d, s, total=1)
+assert "<b>bold</b>" not in emsg.replace("<b>Top picks</b>", ""), "title not escaped"
+# line-count sanity: single section, header + label + 1 item + blank + footer ~5 lines
+assert emsg.count("\n") <= 8, emsg
+print("render_digest_message OK")
+
+# digest_pool: only new + unseen; respects previous last_digest; survives missing key
+import datetime as _dtm
+
+def _ins(rid, published, score=50, sent=None):
+    with r.db() as c:
+        c.execute("INSERT INTO articles (id,url,title,source,published,score,sent_at)"
+                  " VALUES (?,?,?,?,?,?,?)", (rid, f"http://x/{rid}", f"t{rid}", "s", published, score, sent))
+
+_ins("d1", _dtm.datetime.now(_dtm.timezone.utc).isoformat(), 50, None)  # new, in window → eligible
+_ins("d2", r.age_cutoff(), 50, "2026-01-01T00:00:00")  # already sent → excluded
+_ins("d3", "1990-01-01T00:00:00", 50, None)    # too old (beyond age_cutoff) → excluded
+_ins("d4", r.age_cutoff(), 1, None)             # below MIN_SCORE → excluded
+# no last_digest set → digest_pool must NOT KeyError (stored-only key, absent)
+p = r.digest_pool()
+assert {x['id'] for x in p} == {"d1"}, {x['id'] for x in p}
+assert p and p[0]['id'] == 'd1'
+# after recording a last_digest, older-but-unseen remain eligible only if newer than it
+with r.db() as c:
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("last_digest", "2100-01-01T00:00:00"))
+p2 = r.digest_pool()
+assert p2 == [], p2
+print("digest_pool new+unseen + missing-key OK")
+
 print("ALL TESTS PASSED")

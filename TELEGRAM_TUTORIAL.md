@@ -24,22 +24,34 @@ Find the bot in Telegram and press **Start** (or send `/start`).
 
 ## What you get each day
 
-Once a day the bot pushes your **daily digest** — a batch of article links,
-sorted by how well they match your taste:
+Once a day the bot pushes your **daily digest** — a compact message of your
+best new articles, grouped into sections. Articles are only picked if they are
+**new and unseen** (not already read via `/feed`):
 
 ```
-85 · <link> Title of an article — The Source
-78 · <link> Another headline — Different Site
-...
-📰 Your feed — 12 articles
+📰 Daily Digest · Mon 01 Sep
+
+🔥 Top picks
+1. Title of an article — The Source
+2. Another headline — Different Site
+
+💬 Most discussed
+3. A hot topic — Hacker News (412 pts / 180 cmts)
+
+📚 Worth a skim
+4. A quick read — Some Blog
+
+· 12 new articles · 👍/👎 on /feed refines your profile
 ```
 
-Each line is `score · link title — source`. A `~` after the score means the bot
-is only *fairly* sure it matches you; a `?` means it is guessing. Higher is
-better.
+Each line is `number · link title — source`. Where available, **💬 Most
+discussed** ranks articles by Hacker News votes/comments. Tapping a line opens
+the article. The digest doesn't mark these as read, so the same articles stay
+available in `/feed` to like or dislike.
 
 The bot is quiet the rest of the day unless something breaks — then it sends
-you a short error note.
+you a short error note. Use `/digest` any time to pull the day's digest on
+demand (instead of waiting for the scheduled push).
 
 ---
 
@@ -63,6 +75,7 @@ profile**, which the bot uses when scoring new articles.
 | Command | What it does |
 |---|---|
 | `/feed` | Show your current best articles right now (instead of waiting for the daily digest). Add a number to change the count, e.g. `/feed 5`. |
+| `/digest` | Pull the compact daily digest now (new + unseen articles) instead of waiting for the scheduled push |
 | `/fetch` | Pull the newest articles from your subscribed feeds now (usually you don't need to — the bot does this itself every 30 minutes) |
 | `/scoreall` | Force-score everything that isn't scored yet (e.g. right after setup). Usually not needed. |
 | `/profile` | See your current taste profile — the plain-text description of "what you're into" (with the 👍/👎 build up) |
@@ -111,7 +124,8 @@ results instead of an error).
 
 | KEY | Meaning | Default |
 |---|---|---|
-| `TOP_N` | How many articles appear in a `/feed` or daily digest | `30` |
+| `TOP_N` | How many articles appear in a `/feed` (add `N` to view more) | `8` |
+| `DIGEST_TOP` | How many articles appear in the daily digest message | `8` |
 | `MIN_SCORE` | Minimum score for an article to make the digest (raise if you get too much fluff, lower if too little) | `10` |
 | `DIGEST_HOUR` | Hour (0–23) when the daily digest is pushed | `8` |
 | `IGNORE_AFTER_H` | Ignore articles older than this many hours | `12` |
@@ -151,8 +165,8 @@ changes, check with `/get` whether the value was accepted.
   interests and keep reaction- 👍 articles; it learns fast.
 - **"I don't want that feed anymore."** → Reply to an article from it and send
   `/removefeed` hands-free, or `/removefeed https://the.feed.url`.
-- **"Too much noise."** → Raise `MIN_SCORE` and/or shrink `TOP_N`:
-  `/set MIN_SCORE 15`, `/set TOP_N 15`.
+- **"Too much noise."** → Raise `MIN_SCORE` and/or shrink `DIGEST_TOP` (digest)
+  or `TOP_N` (`/feed`): `/set MIN_SCORE 15`, `/set DIGEST_TOP 5`, `/set TOP_N 15`.
 
 ---
 
