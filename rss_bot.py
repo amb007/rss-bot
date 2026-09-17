@@ -665,6 +665,10 @@ _DEAD_STATUSES = {401, 403, 404, 405, 410}   # model gone / not-authorized → n
 _429_STORM_LIMIT = 3   # consecutive retry-exhausted 429 calls before we treat
                        # a rate-limited model as degraded and fall back
 _consec_429_storms = 0
+# (backend, model) pairs already probed and found non-working during the current
+# fallback crisis. Kept so we don't cycle forever among providers; cleared as
+# soon as an LLM call actually succeeds.
+_fallback_tried: set[tuple[str, str]] = set()
 
 async def _llm_request(messages: list[dict], max_tokens: int) -> str:
     headers = {"Content-Type": "application/json"}
@@ -701,14 +705,19 @@ async def notify_owner(text: str) -> None:
     except Exception as e:
         logging.warning(f"notify_owner failed: {e}")
 
-async def _fallback_and_switch(status: int | None) -> bool:
-    """On a dead model, discover+probe a replacement and switch to it (once)."""
+async def _fallback_and_switch(status: int | None, prefer_other_provider: bool = False) -> bool:
+    """On a dead model, discover+probe a replacement and switch to it (once).
+    `prefer_other_provider` deprioritizes candidates on the current backend so a
+    provider-wide outage jumps to a different provider instead of bouncing
+    among rate-limited siblings. Never re-uses a (backend, model) already tried
+    this crisis (via _fallback_tried), so it can't cycle among providers forever."""
     if status is not None and status not in _DEAD_STATUSES and status < 500:
         return False  # 400/422 = payload bug, not a dead model — don't mask it
     if not S("AUTOMODEL_ENABLED"):
         return False
     try:
-        selection = await select_fallback(current_llm_model())
+        selection = await select_fallback(current_llm_model(),
+                                          prefer_other_provider=prefer_other_provider)
     except Exception as e:
         logging.warning(f"Fallback failed: {e}")
         return False
@@ -734,6 +743,7 @@ async def llm_chat(messages: list[dict], max_tokens=512, retries=None) -> str:
         try:
             result = await _llm_request(messages, max_tokens)
             _consec_429_storms = 0
+            _fallback_tried.clear()   # crisis over — forget expired fallbacks
             return result
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
@@ -751,7 +761,8 @@ async def llm_chat(messages: list[dict], max_tokens=512, retries=None) -> str:
                     if _consec_429_storms >= _429_STORM_LIMIT:
                         logging.warning(f"429 storm x{_consec_429_storms} — treating model as degraded")
                         _consec_429_storms = 0
-                        if await _fallback_and_switch(None):
+                        # provider-wide rate limit → jump to a different backend
+                        if await _fallback_and_switch(None, prefer_other_provider=True):
                             await _llm_throttle()
                             return await _llm_request(messages, max_tokens)
                 elif await _fallback_and_switch(status):
@@ -1008,26 +1019,38 @@ async def probe_models_job() -> None:
             logging.info(f"probe (rotate): {row['backend']}/{row['model_id']} → {status}")
     logging.info(f"probe_models_job done: {batch} stale + {batch} rotating probed")
 
-async def select_fallback(current_model: str) -> tuple[str, str] | None:
+async def select_fallback(current_model: str,
+                          prefer_other_provider: bool = False) -> tuple[str, str] | None:
     """Find the best working free model across configured backends.
 
     Returns (backend, model_id) or None. Prefers models with a recent "ok"
     probe (fresh health), then same family, then highest SWE score. Stale
-    "ok" entries are re-probed before being trusted."""
+    "ok" entries are re-probed before being trusted. Only a genuinely `ok`
+    probe is accepted — a `rate_limited` probe counts as failed (so a
+    provider-wide 429 doesn't bounce us among throttled siblings).
+    Already-tried (backend, model) pairs are skipped to avoid endless cycling,
+    and when `prefer_other_provider` is set (429 storm), candidates on the
+    current backend are strongly deprioritized."""
+    global _fallback_tried
     swe = _load_swe_scores() or await refresh_swe_scores()
     current_backend = current_llm_backend()
     # (priority, score, backend, model) — lower priority probed first
+    # + a same-provider penalty so storms jump to a different provider
+    penalty = 25 if prefer_other_provider else 0
     candidates: list[tuple[int, float, str, str]] = []
     for b in known_backends():
         models = await discover_models(b)
         for mid in models:
             if b == current_backend and mid == current_model:
                 continue  # skip the model that just failed
+            if (b, mid) in _fallback_tried:
+                continue  # already probed this crisis and it failed
             if not _is_text_model(mid):
                 continue  # image/tts/embedding models can't score text
             score = _swe_score_for(mid, swe)
             if b == current_backend:
-                score += 3
+                score -= penalty          # deprioritize current provider in a storm
+                score += 3                # mild same-backend preference otherwise
             if _family_token(mid) and _family_token(mid) == _family_token(current_model):
                 score += 5
             # priority 0 = fresh ok (recent known-good), 1 = everything else
@@ -1038,13 +1061,13 @@ async def select_fallback(current_model: str) -> tuple[str, str] | None:
     # probe in order: fresh-known-good first, then re-verify others
     for priority, score, b, mid in candidates[:PROBE_MAX_CANDIDATES]:
         health = _health_fresh(b, mid)
-        # trust a fresh "ok" only if the backend/key look right — re-probe anyway
-        # for a cheap liveness confirm (we're in a crisis; be safe)
         status = await probe_model(b, mid)
         _record_health(b, mid, status)
-        if status in ("ok", "rate_limited"):
-            logging.info(f"Fallback selected: {mid} ({b}) — score {score:.0f} (was {health})")
-            return b, mid
+        if status != "ok":
+            _fallback_tried.add((b, mid))   # remember failure → don't re-probe it this crisis
+            continue
+        logging.info(f"Fallback selected: {mid} ({b}) — score {score:.0f} (was {health})")
+        return b, mid
     return None
 
 def get_taste_profile() -> str:

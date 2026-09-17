@@ -141,20 +141,29 @@ times out/5xx) and `AUTOMODEL_ENABLED` is on, the bot:
 1. Discovers live model IDs from every configured backend's `/models` endpoint,
 2. Filters out non-text models (image/tts/embedding/…) — they can pass a probe
    but can't score articles,
-3. Probes each candidate's `/chat/completions` to verify it actually serves,
+3. Probes each candidate's `/chat/completions` to verify it actually serves —
+   **only a genuinely `ok` probe is accepted**; a `rate_limited` probe counts as
+   failed (see 429-storm note below), so a throttled provider can't be selected
+   as a "win",
 4. **Prioritizes models with a recent successful probe** — a fresh `ok` entry in
    the `model_health` table is tried before untested/unknown candidates,
 5. Re-probes stale "ok" entries (older than `MODEL_PROBE_REFRESH_HOURS`) before
    trusting them — a model that worked 5 days ago is not assumed to still work,
 6. Ranks the remaining working candidates by **SWE-bench** coding score (fetched
    live from swebench.com, cached weekly) × same-family × same-backend,
-7. Switches to the best working model via `/model`-equivalent persistence, and
+7. **Skips providers already tried this crisis** — every `(backend, model)` pair
+   probed and rejected is remembered (until an LLM call succeeds), so fallback
+   can't cycle forever among providers,
+8. Switches to the best working model via `/model`-equivalent persistence, and
    notifies the owner in Telegram.
 
 A **429 storm** (the free-tier rate limit that never resolves, e.g. a model
 whose quota is exhausted) also triggers fallback: after
 `_429_STORM_LIMIT` consecutive retry-exhausted 429 calls, the model is treated
-as degraded and switched away from.
+as degraded and switched away from. Because a 429 is often **provider-wide**
+(one shared API key), the storm path **deprioritizes the current provider** and
+jumps to a model on a *different* backend (e.g. goo → nim/zen) rather than
+bouncing among rate-limited siblings.
 
 **Proactive probing** — besides reacting to failures, a periodic job
 (`probe_models_job`, every `MODEL_PROBE_INTERVAL_H` hours) refreshes `model_health`

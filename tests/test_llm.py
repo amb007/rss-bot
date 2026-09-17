@@ -280,8 +280,9 @@ r._llm_throttle = _no_throttle   # speed up: no real throttle in tests
 
 orig_request = r._llm_request
 switches = []
-async def _fake_fallback(status):
+async def _fake_fallback(status, prefer_other_provider=False):
     switches.append(status)
+    assert prefer_other_provider is True   # storm must ask for a different provider
     return False   # no fallback selected → llm_chat must raise
 r._llm_request = _always_429
 try:
@@ -448,5 +449,65 @@ with r.db() as c:
 p2 = r.digest_pool()
 assert p2 == [], p2
 print("digest_pool new+unseen + missing-key OK")
+
+
+# --- select_fallback: rate_limited NOT accepted, tried pairs remembered ---
+orig_disc, orig_probe, orig_known = r.discover_models, r.probe_model, r.known_backends
+orig_text, orig_health = r._is_text_model, r._health_fresh
+orig_swe = r._load_swe_scores
+orig_family = r._family_token
+r._load_swe_scores = lambda: {}
+plan = {}   # backend -> (seq, statuses) consumed in order
+probed = []
+r.known_backends = lambda: ["goo", "nim"]
+r._is_text_model = lambda m: True
+r._health_fresh = lambda b, m: None
+r._family_token = lambda m: ""
+async def _fake_discover(b):
+    return [f"{b}-m1", f"{b}-m2"]
+async def _fake_probe(b, m):
+    probed.append((b, m))
+    seq, statuses = plan[b]
+    plan[b] = (seq + 1, statuses)
+    return statuses[seq]
+r.discover_models = _fake_discover
+r.probe_model = _fake_probe
+
+try:
+    # (1) default path: goo is preferred (same-backend bonus) but its probes come
+    # back rate_limited → rejected → keep probing → pick the genuinely-ok nim.
+    # A rate_limited model is never the final fallback answer.
+    r._fallback_tried.clear()
+    probed.clear()
+    plan = {"goo": (0, ["rate_limited"]*50), "nim": (0, ["ok", "ok"])}
+    got = _asyncio.run(r.select_fallback("goo-old"))
+    assert got == ("nim", "nim-m1"), got
+    assert ("goo", "goo-m1") in probed   # goo was probed & rejected
+    print("select_fallback rejects rate_limited, jumps provider OK", got)
+
+    # (2) without reset, the already-tried goo-m1/goo-m2 are skipped (not
+    # re-probed); a fresh nim model is still eligible and picks.
+    probed.clear()
+    plan = {"goo": (0, ["ok"]*50), "nim": (0, ["ok", "ok"])}
+    got = _asyncio.run(r.select_fallback("goo-old"))
+    assert got == ("nim", "nim-m1"), got
+    assert not any(b == "goo" for b, m in probed), probed   # goo skipped, not re-tried
+    print("select_fallback skips already-tried OK")
+
+    # (3) all-fail → None, and every failed pair is remembered
+    r._fallback_tried.clear()
+    probed.clear()
+    plan = {"goo": (0, ["rate_limited"]*50), "nim": (0, ["down", "down"])}
+    got = _asyncio.run(r.select_fallback("goo-old"))
+    assert got is None, got
+    assert any(b == "goo" for b, m in r._fallback_tried)
+    assert any(b == "nim" for b, m in r._fallback_tried)
+    print("select_fallback remembers failures + returns None OK")
+finally:
+    r.discover_models, r.probe_model, r.known_backends = orig_disc, orig_probe, orig_known
+    r._is_text_model, r._health_fresh = orig_text, orig_health
+    r._load_swe_scores = orig_swe
+    r._family_token = orig_family
+    r._fallback_tried.clear()
 
 print("ALL TESTS PASSED")
