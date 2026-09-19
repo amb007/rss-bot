@@ -510,4 +510,40 @@ finally:
     r._family_token = orig_family
     r._fallback_tried.clear()
 
+
+# --- hnrss.org scoring feed parsing + digest overlay + theme ---
+hn_xml = ("<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>"
+          "<item><link>https://example.com/a</link>"
+          "<comments>https://news.ycombinator.com/item?id=111</comments>"
+          "<description><![CDATA[<p>Points: 42</p><p># Comments: 7</p>]]></description></item>"
+          "<item><link>https://example.com/b</link>"
+          "<comments>https://news.ycombinator.com/item?id=222</comments>"
+          "<description><![CDATA[<p>Points: 1,234</p><p># Comments: 0</p>]]></description></item>"
+          "</channel></rss>")
+parsed = r.parse_hn_scoring_feed(hn_xml)
+assert parsed["https://example.com/a"]["points"] == 42, parsed
+assert parsed["https://example.com/a"]["comments"] == 7, parsed
+assert parsed["https://example.com/b"]["points"] == 1234, parsed  # comma stripped
+assert "https://news.ycombinator.com/item?id=111" in parsed  # indexed under item URL too
+print("parse_hn_scoring_feed OK", parsed["https://example.com/a"])
+
+# overlay matches pool rows and fills HN fields even when stored url is the item
+pool = [{"url": "https://example.com/a", "hn_points": 0, "hn_comments": 0},
+        {"url": "https://example.com/b/", "hn_points": 0, "hn_comments": 0},
+        {"url": "https://nowhere.example", "hn_points": 0, "hn_comments": 0}]
+r._overlay_hn_scores(pool, parsed)
+assert pool[0]["hn_points"] == 42 and pool[0]["hn_comments"] == 7
+assert pool[1]["hn_points"] == 1234, pool[1]
+assert pool[2]["hn_points"] == 0  # unmatched stays 0
+print("overlay_hn_scores OK")
+
+# render includes the theme opener right under the header, before Top picks
+_top = [_mk("t", 10)]
+_t, _d, _s = r.group_digest(_top, budget=8)
+_msg = r.render_digest_message(_t, _d, _s, 1, theme="Today is all about X.")
+assert _msg.startswith("📰 Daily Digest"), _msg
+assert "Today is all about X." in _msg
+assert _msg.index("Today is all about X.") < _msg.index("Top picks"), _msg
+print("render_digest_message with theme OK")
+
 print("ALL TESTS PASSED")

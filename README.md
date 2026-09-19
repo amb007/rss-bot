@@ -119,6 +119,7 @@ app.add_handler(MessageReactionHandler(handle_reaction, chat_id=TELEGRAM_CHAT_ID
 | `IGNORE_AFTER_H` | `12` | Article age (h) before it's ignored by the digest |
 | `TOP_N` | `8` | Max articles shown in `/feed` |
 | `DIGEST_TOP` | `8` | Max articles shown in the daily digest message |
+| `DIGEST_THEME` | `1` | 2-line LLM "today's theme" opener at the top of the digest (`0` to disable) |
 | `MIN_SCORE` | `10` | Minimum LLM score for a "keep" article |
 | `PROFILE_EXAMPLES` | `30` | Number of saved-article examples used to derive the interest profile |
 | `SCORE_BATCH` | `10` | Articles scored per LLM batch |
@@ -132,6 +133,12 @@ Settings come from `.env` (env vars win), then the `settings` table in the
 instance DB, then `SETTING_DEFAULTS`.
 
 `feeds.txt` is one feed URL per line, e.g. `http://arxiv.org/rss/cs.SE`.
+
+A **fresh instance with no feeds** is automatically seeded with
+`https://hnrss.org/frontpage` (Hacker News) so a brand-new bot has something to
+fetch right away, and so the digest's **💬 Most discussed** section has real
+points/comments out of the box. Existing/deliberately-empty feed lists are left
+alone.
 
 ### Smart model fallback
 
@@ -196,9 +203,12 @@ Runs on a scheduler inside the same process (APScheduler):
 2. `daily_digest_job` (and `/digest`) — at `DIGEST_HOUR` select *new + unseen*
    articles (`score >= MIN_SCORE`, not yet `sent_at`, published after the last
    digest) and push a compact grouped message to `TELEGRAM_CHAT_ID` through
-   `send_digest()`. It renders one message grouped into **🔥 Top picks**,
-   **💬 Most discussed** (by HN votes), and **📚 Worth a skim**, capped at
-   `DIGEST_TOP`. Shown articles stay unread (no `sent_at` set), so you can still
+   `send_digest()`. It renders one message with a short **LLM "today's theme"**
+   opener (when `DIGEST_THEME` is on), then up to `DIGEST_TOP` articles grouped
+   into **🔥 Top picks** (interest score) and, when an HN-compatible feed is
+   used (`*ycombinator.com*` / `*hnrss.org*`), **💬 Most discussed** by live
+   Hacker News votes pulled from `https://hnrss.org/frontpage`. Shown articles
+   stay unread (no `sent_at` set), so you can still
    👍/👎 them in `/feed`; the digest window advances via the `last_digest`
    setting so nothing is re-offered next run.
 3. Errors during the hourly job are pushed straight to the owner's chat.

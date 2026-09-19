@@ -25,29 +25,32 @@ Find the bot in Telegram and press **Start** (or send `/start`).
 ## What you get each day
 
 Once a day the bot pushes your **daily digest** — a compact message of your
-best new articles, grouped into sections. Articles are only picked if they are
-**new and unseen** (not already read via `/feed`):
+best new articles. Articles are only picked if they are **new and unseen**
+(not already read via `/feed`):
 
 ```
 📰 Daily Digest · Mon 01 Sep
+Today there's a theme around efficient coding —
+three picks on making LLMs cheaper to run.
 
 🔥 Top picks
 1. Title of an article — The Source
 2. Another headline — Different Site
 
 💬 Most discussed
-3. A hot topic — Hacker News (412 pts / 180 cmts)
-
-📚 Worth a skim
-4. A quick read — Some Blog
+3. A hot topic — Hacker News (149 pts / 119 cmts)
 
 · 12 new articles · 👍/👎 on /feed refines your profile
 ```
 
-Each line is `number · link title — source`. Where available, **💬 Most
-discussed** ranks articles by Hacker News votes/comments. Tapping a line opens
-the article. The digest doesn't mark these as read, so the same articles stay
-available in `/feed` to like or dislike.
+The message opens with a short **"today's theme"** line (generated from your
+top picks), then the **🔥 Top picks** ranked by how well they match you. When
+you subscribe to a Hacker News feed (`*ycombinator.com*` or `*hnrss.org*`), a
+**💬 Most discussed** section appears, using live HN points/comments.
+
+Each line is `number · link title — source`. Tapping a line opens the article.
+The digest doesn't mark these as read, so the same articles stay available in
+`/feed` to like or dislike.
 
 The bot is quiet the rest of the day unless something breaks — then it sends
 you a short error note. Use `/digest` any time to pull the day's digest on
@@ -126,6 +129,7 @@ results instead of an error).
 |---|---|---|
 | `TOP_N` | How many articles appear in a `/feed` (add `N` to view more) | `8` |
 | `DIGEST_TOP` | How many articles appear in the daily digest message | `8` |
+| `DIGEST_THEME` | Turn the "today's theme" opener in the digest on/off (`0` to disable) | `1` |
 | `MIN_SCORE` | Minimum score for an article to make the digest (raise if you get too much fluff, lower if too little) | `10` |
 | `DIGEST_HOUR` | Hour (0–23) when the daily digest is pushed | `8` |
 | `IGNORE_AFTER_H` | Ignore articles older than this many hours | `12` |

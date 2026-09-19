@@ -78,6 +78,7 @@ def instance_phase_offset_seconds() -> int:
 SETTING_DEFAULTS = {
     "DIGEST_HOUR":          "8",
     "DIGEST_TOP":           "8",
+    "DIGEST_THEME":         "1",
     "IGNORE_AFTER_H":       "12",
     "TOP_N":                "8",
     "MIN_SCORE":            "10",
@@ -482,15 +483,34 @@ def age_cutoff() -> str:
 
 # ── feed fetching ─────────────────────────────────────────────────────────────
 
+# Default feed used when a fresh instance has no feeds.txt yet (a fresh install)
+# → seed with Hacker News so the digest's "Most discussed" section has real
+# points/comments right away.
+DEFAULT_HN_URL = "https://hnrss.org/frontpage"
+
 def _load_feeds_from_file() -> list[str]:
     if not FEEDS_FILE.exists():
-        FEEDS_FILE.write_text("# one feed URL per line\n")
-        return []
+        FEEDS_FILE.write_text(f"# one feed URL per line\n{DEFAULT_HN_URL}\n")
+        return [DEFAULT_HN_URL]
     return [l.strip() for l in FEEDS_FILE.read_text().splitlines()
             if l.strip() and not l.startswith("#")]
 
 def _sync_feeds_with_file():
     if not FEEDS_FILE.exists():
+        # Fresh instance: no feeds.txt yet. Seed the DB (and write feeds.txt) with
+        # a default HN feed so a brand-new bot has something to fetch and the
+        # digest's "Most discussed" section has real points/comments immediately.
+        with db() as c:
+            active = c.execute("SELECT COUNT(*) AS n FROM feeds WHERE deleted=0").fetchone()["n"]
+            if active == 0:
+                now = datetime.now(timezone.utc).isoformat()
+                c.execute("INSERT OR IGNORE INTO feeds (url, added_at) VALUES (?,?)",
+                          (DEFAULT_HN_URL, now))
+                try:
+                    FEEDS_FILE.write_text(f"# one feed URL per line\n{DEFAULT_HN_URL}\n")
+                    logging.info(f"Seeded fresh instance with default feed: {DEFAULT_HN_URL}")
+                except Exception as e:
+                    logging.warning(f"Could not write seeded feeds.txt: {e}")
         return
     now = datetime.now(timezone.utc).isoformat()
     lines = FEEDS_FILE.read_text().splitlines()
@@ -519,6 +539,38 @@ def load_feeds() -> list[dict]:
     with db() as c:
         rows = c.execute("SELECT id, url FROM feeds WHERE deleted=0 ORDER BY id").fetchall()
         return [dict(r) for r in rows]
+
+def uses_hn_feed() -> bool:
+    """True if any configured feed is an HN source (news.ycombinator.com/rss or
+    an hnrss.org feed) — the signal that HN points/comments can back the
+    digest's "Most discussed" section."""
+    return any("ycombinator.com" in (f["url"] or "").lower()
+               or "hnrss.org" in (f["url"] or "").lower()
+               for f in load_feeds())
+
+def parse_hn_scoring_feed(xml_text: str) -> dict[str, dict]:
+    """Parse an hnrss.org feed into {item_url: {points, comments}}.
+    hnrss.org puts "Points: N" / "# Comments: N" in each entry's <description>."""
+    parsed = feedparser.parse(xml_text)  # type: ignore[no-untyped-call]
+    out: dict[str, dict] = {}
+    for e in parsed.entries:
+        link = (e.get("link") or "").strip()
+        item = (e.get("comments") or "").strip()
+        desc = e.get("summary") or e.get("description") or ""
+        pts = cmts = 0
+        m = re.search(r"Points?:?\s*([\d,]+)", desc)
+        if m:
+            pts = int(m.group(1).replace(",", ""))
+        m = re.search(r"#?\s*Comments?:?\s*([\d,]+)", desc)
+        if m:
+            cmts = int(m.group(1).replace(",", ""))
+        score = {"points": pts, "comments": cmts}
+        # index under both the article link and the HN item URL so overlay
+        # matches either stored form.
+        for k in dict.fromkeys((link, item)):
+            if k:
+                out[k.rstrip("/")] = score
+    return out
 
 FEED_UA = "rss-bot/1.0"
 
@@ -1387,9 +1439,12 @@ def group_digest(pool: list[dict], budget: int = 8):
     skim = [r for r in rest if r["id"] not in disc_ids][:max(0, budget - len(top) - len(discussed))]
     return top, discussed, skim
 
-def render_digest_message(top, discussed, skim, total: int) -> str:
+def render_digest_message(top, discussed, skim, total: int, theme: str = "") -> str:
     day = datetime.now(timezone.utc).strftime("%a %d %b")
-    lines = [f"📰 Daily Digest · {day}", ""]
+    lines = [f"📰 Daily Digest · {day}"]
+    if theme:
+        lines.append(theme)
+    lines.append("")
     def _item(r, num):
         title = escape_html(r["title"] or r["url"])
         source = escape_html(r["source"] or "")
@@ -1416,6 +1471,56 @@ def render_digest_message(top, discussed, skim, total: int) -> str:
     lines.append(tail)
     return "\n".join(lines)
 
+async def _fetch_hnrss_overlay() -> dict:
+    """Live HN points/comments from hnrss.org/frontpage, keyed by article URL.
+    Returns a dict {url: {"points": int, "comments": int}} for matching digest
+    rows. Best-effort; returns {} on any network/parse failure."""
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            r = await client.get("https://hnrss.org/frontpage",
+                                 headers={"User-Agent": FEED_UA})
+            r.raise_for_status()
+            return parse_hn_scoring_feed(r.text)
+    except Exception as e:
+        logging.warning(f"hnrss fetch failed: {e}")
+        return {}
+
+def _overlay_hn_scores(pool: list[dict], hn: dict) -> None:
+    """Match digest pool rows to hnrss scores by URL and set their HN fields.
+    A row's stored `url` may be the HN item page (news.ycombinator.com/item?...)
+    — accept both the bare article link and the item URL as keys."""
+    # hnrss is keyed by the HN item URL (comments). Build a secondary index by
+    # stripping the item path to also match plain/article IDs.
+    def _item_key(u: str) -> str:
+        return u.rstrip("/")
+    for r in pool:
+        u = _item_key(r.get("url") or "")
+        hit = hn.get(u)
+        if not hit:
+            # try bare ID after the item query
+            m = re.search(r"[?&]id=(\d+)", u)
+            if m:
+                hit = next((v for k, v in list(hn.items()) if m.group(1) in k), None)
+        if hit:
+            r["hn_points"] = hit.get("points", 0)
+            r["hn_comments"] = hit.get("comments", 0)
+
+async def _digest_theme(top: list[dict]) -> str:
+    """2-line LLM opener summarizing what today's top picks are about.
+    Best-effort: returns "" on failure or when DISABLED via DIGEST_THEME=0."""
+    if not top or not S("DIGEST_THEME"):
+        return ""
+    ctx = "\n".join(f"• {r['title']} ({r.get('source')})" for r in top[:5])
+    try:
+        reply = await llm_chat([{"role": "user", "content":
+            "In 2 short lines, summarize the common theme of today's top news "
+            "picks and why they matter. No markdown, no intro, 2 lines max.\n\n"
+            + ctx}], max_tokens=120, retries=2)
+        return "\n".join(x.strip() for x in (reply or "").splitlines()[:2]).strip()
+    except Exception as e:
+        logging.warning(f"digest theme failed: {e}")
+        return ""
+
 async def send_digest(bot, chat_id: int) -> int:
     """Send one compact grouped digest message and advance the digest window.
     Articles are NOT marked sent_at, so they stay in /feed where the user can
@@ -1423,10 +1528,18 @@ async def send_digest(bot, chat_id: int) -> int:
     pool = digest_pool()
     if not pool:
         return 0
+    # if the user subscribes to HN, pull live scores from hnrss.org so the
+    # "Most discussed" section has real points/comments even for articles that
+    # arrive via feeds that don't carry them.
+    if uses_hn_feed():
+        hn = await _fetch_hnrss_overlay()
+        if hn:
+            _overlay_hn_scores(pool, hn)
     top, discussed, skim = group_digest(pool, budget=int(S("DIGEST_TOP")))
+    theme = await _digest_theme(top)
     shown = top + discussed + skim
     await tg_send(bot.send_message, chat_id=chat_id,
-                  text=render_digest_message(top, discussed, skim, len(pool)),
+                  text=render_digest_message(top, discussed, skim, len(pool), theme),
                   parse_mode="HTML", disable_web_page_preview=True)
     now = datetime.now(timezone.utc).isoformat()
     with db() as c:
