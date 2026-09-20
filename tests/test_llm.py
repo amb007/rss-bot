@@ -546,4 +546,72 @@ assert "Today is all about X." in _msg
 assert _msg.index("Today is all about X.") < _msg.index("Top picks"), _msg
 print("render_digest_message with theme OK")
 
+
+# --- /unseen + score/published tiebreak sort ---
+just_before = (_dtm.datetime.now(_dtm.timezone.utc) - _dtm.timedelta(days=8)).isoformat()
+very_old    = (_dtm.datetime.now(_dtm.timezone.utc) - _dtm.timedelta(days=20)).isoformat()
+recent_now  = _dtm.datetime.now(_dtm.timezone.utc).isoformat()
+
+def _ins_full(rid, published, score, sent=None, ignored=None, disliked=None):
+    with r.db() as c:
+        c.execute("INSERT INTO articles (id,url,title,source,published,score,sent_at,ignored_at,disliked_at)"
+                  " VALUES (?,?,?,?,?,?,?,?,?)",
+                  (rid, f"http://x/{rid}", f"t{rid}", "s", published, score, sent, ignored, disliked))
+
+# old + unseen + unvoted → eligible for /unseen
+_ins_full("u1", very_old,    90, None, None, None)
+_ins_full("u2", just_before, 80, None, None, None)   # equal score with u3, older pub
+_ins_full("u3", just_before, 80, None, None, None)
+# exclusions: seen(sent), disliked, and recent(too new)
+_ins_full("u4", just_before, 70, "2026-01-01T00:00:00", None, None)   # sent → skip
+_ins_full("u5", just_before, 60, None, None, "2026-01-01T00:00:00")  # disliked → skip
+_ins_full("u6", recent_now,  95, None, None, None)                     # recent → skip
+
+_unseen_ids = [x['id'] for x in r.unseen_snapshot()]
+assert "u1" in _unseen_ids and "u2" in _unseen_ids and "u3" in _unseen_ids, _unseen_ids
+assert "u4" not in _unseen_ids and "u5" not in _unseen_ids and "u6" not in _unseen_ids, _unseen_ids
+# equal-score order: oldest published first
+assert _unseen_ids.index("u2") < _unseen_ids.index("u3"), _unseen_ids
+print("/unseen filters old+unseen+unvoted, sorts score desc/oldest-first OK")
+
+# /feed tiebreak: equal score → published ASC
+_feed_two = ["f1", "f2"]
+_ins_full("f1", recent_now, 55, None, None, None)
+_ins_full("f2", (_dtm.datetime.now(_dtm.timezone.utc) - _dtm.timedelta(hours=6)).isoformat(), 55, None, None, None)
+_feed_ids = [x['id'] for x in r.digest_snapshot()]
+assert _feed_ids.index("f1") > _feed_ids.index("f2"), _feed_ids   # f2 older pub, listed first
+print("/feed tiebreak (score desc, published asc) OK")
+
+
+# --- hnrss overlay: retries then falls back to cached snapshot ---
+_orig_client = _httpx.AsyncClient
+class _FailingClient:
+    def __init__(self, *a, **k): pass
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a, **k): pass
+    async def get(self, url, headers=None):
+        raise OSError("bogus network")
+# seed a cached snapshot, then force all fetches to fail → must return the cache
+r._hnrss_cache = {"https://example.com/cached": {"points": 9, "comments": 2}}
+_httpx.AsyncClient = _FailingClient
+_orig_sleep = r.asyncio.sleep
+async def _instant_sleep(secs):  # no-op, avoid waiting 2s+4s in the retry backoff
+    return None
+r.asyncio.sleep = _instant_sleep
+try:
+    calls = {"n": 0}
+    class _FailCountingClient(_FailingClient):
+        async def get(self, url, headers=None):
+            calls["n"] += 1
+            raise OSError("bogus network")
+    _httpx.AsyncClient = _FailCountingClient
+    got = _asyncio.run(r._fetch_hnrss_overlay())
+    assert got == {"https://example.com/cached": {"points": 9, "comments": 2}}, got
+    assert calls["n"] == r.HNRSS_RETRIES, calls  # retried HNRSS_RETRIES times
+    print(f"hnrss retries ({calls['n']}x) + cache fallback OK")
+finally:
+    _httpx.AsyncClient = _orig_client
+    r.asyncio.sleep = _orig_sleep
+    r._hnrss_cache = {}
+
 print("ALL TESTS PASSED")

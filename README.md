@@ -12,8 +12,8 @@ whole thing.
 <table>
   <tr>
     <td valign="bottom"><img src="images/feed.jpg" width="200"/></td>
-    <td valign="bottom"><img src="images/search.jpg" width="200"/></td>
-    <td valign="bottom"><img src="images/stats.jpg" width="200"/></td>
+    <td valign="bottom"><img src="images/digest.jpg" width="200"/></td>
+    <td valign="bottom"><img src="images/search.jpg" width="200"/><br><img src="images/stats.jpg" width="200"/></td>
     <td valign="bottom"><img src="images/models.jpg" width="200"/></td>
     <td valign="bottom"><img src="images/commands.jpg" width="200"/></td>
   </tr>
@@ -225,6 +225,7 @@ point `<BACKEND>_BASE_URL` (e.g. `LLAMACPP_BASE_URL`) at a local
 |---|---|
 | `/start` | Hello + bot commands |
 | `/feed` | Get the current pending feed (fresh scored articles) |
+| `/unseen` | Old never-seen articles too old for /feed (sorted score DESC, then oldest-first) |
 | `/digest` | Push the compact daily digest now (new + unseen articles) |
 | `/fetch` | Force a feed fetch + scoring cycle |
 | `/profile` | Show the current saved-articles interest profile |

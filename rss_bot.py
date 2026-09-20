@@ -1364,8 +1364,27 @@ def digest_snapshot() -> list[dict]:
                    confidence, liked_at, disliked_at
             FROM articles
             WHERE score >= ? AND sent_at IS NULL AND published >= ?
-            ORDER BY score DESC
+            ORDER BY score DESC, published ASC
         """, (S("MIN_SCORE"), cutoff)).fetchall()
+    return [dict(r) for r in rows]
+
+def unseen_snapshot() -> list[dict]:
+    """Old, never-seen articles (sent_at IS NULL, not ignored/disliked) that
+    are now too old to show in /feed (published before the age window). Ordered
+    by score DESC then published ASC (equal scores show oldest first). These are
+    the backlog items /feed can never surface — the "unseen + too old to show"
+    bucket from /stats — unlike the new-but-not-yet-seen items /feed already
+    returns."""
+    cutoff = age_cutoff()
+    with db() as c:
+        rows = c.execute("""
+            SELECT id, title, source, score, url, hn_points, hn_comments,
+                   confidence, liked_at, disliked_at
+            FROM articles
+            WHERE sent_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL
+              AND published < ?
+            ORDER BY (score IS NULL), score DESC, published ASC
+        """, (cutoff,)).fetchall()
     return [dict(r) for r in rows]
 
 def make_article_msg(r) -> str:
@@ -1471,19 +1490,40 @@ def render_digest_message(top, discussed, skim, total: int, theme: str = "") -> 
     lines.append(tail)
     return "\n".join(lines)
 
+# Most recent successful HN score snapshot (in-memory). Used as a fallback if a
+# later hnrss fetch fails, so "Most discussed" stays populated across transient
+# network blips.
+_hnrss_cache: dict = {}
+
+# NOTE: retries here deliberately do NOT reuse LLM_MAX_RETRIES — hnrss.org is a
+# plain HTTP feed, not an LLM, and its throttle/backoff semantics don't apply.
+HNRSS_RETRIES = 3
+
 async def _fetch_hnrss_overlay() -> dict:
     """Live HN points/comments from hnrss.org/frontpage, keyed by article URL.
     Returns a dict {url: {"points": int, "comments": int}} for matching digest
-    rows. Best-effort; returns {} on any network/parse failure."""
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            r = await client.get("https://hnrss.org/frontpage",
-                                 headers={"User-Agent": FEED_UA})
-            r.raise_for_status()
-            return parse_hn_scoring_feed(r.text)
-    except Exception as e:
-        logging.warning(f"hnrss fetch failed: {e}")
-        return {}
+    rows. Best-effort: retries briefly, then falls back to the last successful
+    snapshot; returns {} only if we've never succeeded."""
+    global _hnrss_cache
+    last_err = None
+    for attempt in range(HNRSS_RETRIES):
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                r = await client.get("https://hnrss.org/frontpage",
+                                     headers={"User-Agent": FEED_UA})
+                r.raise_for_status()
+                parsed = parse_hn_scoring_feed(r.text)
+                if parsed:
+                    _hnrss_cache = parsed
+                return parsed
+        except Exception as e:
+            last_err = e
+            if attempt < HNRSS_RETRIES - 1:
+                await asyncio.sleep((attempt + 1) * 2)
+    if last_err:
+        logging.warning(f"hnrss fetch failed after {HNRSS_RETRIES} tries ({last_err}); "
+                        f"{len(_hnrss_cache)} cached scores {'' if _hnrss_cache else '(none yet)'}")
+    return dict(_hnrss_cache)
 
 def _overlay_hn_scores(pool: list[dict], hn: dict) -> None:
     """Match digest pool rows to hnrss scores by URL and set their HN fields.
@@ -1784,11 +1824,25 @@ async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not sent:
         await update.message.reply_text("Nothing new since your last digest.")  # type: ignore[union-attr]
 
-async def render_feed_page(bot, chat_id: int, snapshot: list[dict], offset: int, n: int) -> None:
+async def cmd_unseen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Inventory of everything not yet seen: sent_at IS NULL, excluding
+    ignored/disliked, incl. below-threshold & unscored. Sorted by score DESC
+    then published ASC (oldest first on ties)."""
+    n = int(ctx.args[0]) if ctx.args and ctx.args[0].isdigit() else int(S("TOP_N"))
+    snapshot = unseen_snapshot()
+    if not snapshot:
+        await tg_send(update.message.reply_text,  # type: ignore[union-attr]
+                             "Nothing unseen yet.")
+        return
+    await render_feed_page(ctx.bot, update.effective_chat.id, snapshot, 0, n, title="Unseen")
+
+async def render_feed_page(bot, chat_id: int, snapshot: list[dict], offset: int, n: int,
+                           title: str = "Your feed") -> None:
     """Send one page of /feed articles as reactable cards + a nav message.
 
     Sets sent_at on the shown page so it's consumed; Prev/Next navigate the
-    stable snapshot (not a re-query). Shared by /feed and the daily digest."""
+    stable snapshot (not a re-query). Shared by /feed, /unseen and the daily digest.
+    `title` sets the nav header ("Your feed" for /feed, "Unseen" for /unseen)."""
     global _feed_token
     total = len(snapshot)
     page = snapshot[offset:offset + n]
@@ -1817,13 +1871,13 @@ async def render_feed_page(bot, chat_id: int, snapshot: list[dict], offset: int,
         next_token = _feed_token
         kb_row.append(InlineKeyboardButton("Next →", callback_data=f"fn:{next_token}"))
     kb = InlineKeyboardMarkup([kb_row]) if len(kb_row) > 1 else None
-    header = f"📰 Your feed — {total} articles (page {cur_page}/{total_pages})"
+    header = f"📰 {title} — {total} articles (page {cur_page}/{total_pages})"
     nav = await bot.send_message(chat_id=chat_id, text=header, reply_markup=kb)
     page_msg_ids = [nav.message_id] + card_ids
     if prev_token:
-        _feed_state[f"fp:{prev_token}"] = (snapshot, n, offset - n, page_msg_ids)
+        _feed_state[f"fp:{prev_token}"] = (snapshot, n, offset - n, page_msg_ids, title)
     if next_token:
-        _feed_state[f"fn:{next_token}"] = (snapshot, n, offset + n, page_msg_ids)
+        _feed_state[f"fn:{next_token}"] = (snapshot, n, offset + n, page_msg_ids, title)
 
 async def handle_feed_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1837,10 +1891,10 @@ async def handle_feed_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not state:
         await q.answer("Feed session expired — run /feed again.")
         return
-    snapshot, n, new_offset, old_ids = state
+    snapshot, n, new_offset, old_ids, title = state
     _feed_state.pop(q.data, None)
     await _delete_msgs(ctx.bot, update.effective_chat.id, old_ids)
-    await render_feed_page(ctx.bot, update.effective_chat.id, snapshot, new_offset, n)
+    await render_feed_page(ctx.bot, update.effective_chat.id, snapshot, new_offset, n, title=title)
     await q.answer()
 
 async def cmd_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2154,13 +2208,29 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         total     = c.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
         too_old   = c.execute("SELECT COUNT(*) FROM articles WHERE published < ?", (cutoff,)).fetchone()[0]
         recent    = total - too_old
-        r_shared  = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND liked_at IS NOT NULL", (cutoff,)).fetchone()[0]
-        r_disliked= c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND disliked_at IS NOT NULL", (cutoff,)).fetchone()[0]
-        r_ignored = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND ignored_at IS NOT NULL AND disliked_at IS NULL", (cutoff,)).fetchone()[0]
-        r_sent    = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NOT NULL AND liked_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL", (cutoff,)).fetchone()[0]
-        r_ready   = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NULL AND score >= ? AND ignored_at IS NULL AND disliked_at IS NULL", (cutoff, S("MIN_SCORE"))).fetchone()[0]
-        r_low     = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NULL AND score IS NOT NULL AND score > 0 AND score < ? AND ignored_at IS NULL AND disliked_at IS NULL", (cutoff, S("MIN_SCORE"))).fetchone()[0]
-        r_unscored= c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND score IS NULL AND ignored_at IS NULL AND disliked_at IS NULL", (cutoff,)).fetchone()[0]
+        # Mutually-exclusive CASE partitions (precedence: liked>disliked>ignored>
+        # sent>score), so each age group's buckets sum exactly to its total.
+        def _buckets(age_pub: str, pubarg: str):
+            rows = c.execute(f"""
+                SELECT CASE
+                  WHEN liked_at    IS NOT NULL THEN 'liked'
+                  WHEN disliked_at IS NOT NULL THEN 'disliked'
+                  WHEN ignored_at  IS NOT NULL THEN 'ignored'
+                  WHEN sent_at     IS NOT NULL THEN 'sent'
+                  ELSE 'ready'
+                END AS bucket, COUNT(*) AS n
+                FROM articles WHERE {age_pub}
+                GROUP BY bucket""", (pubarg,)).fetchall()
+            return {r["bucket"]: r["n"] for r in rows}
+        def _bucket(bk, b): return bk.get(b, 0)
+        ok = _buckets("published < ?", cutoff);  _o = lambda b: _bucket(ok, b)
+        rk = _buckets("published >= ?", cutoff); _r = lambda b: _bucket(rk, b)
+        t_liked, t_disliked, t_ignored, t_sent, t_ready = _o('liked'), _o('disliked'), _o('ignored'), _o('sent'), _o('ready')
+        r_liked, r_disliked, r_ignored, r_sent = _r('liked'), _r('disliked'), _r('ignored'), _r('sent')
+        # split the recent 'ready' bucket by score threshold
+        r_ready   = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL AND score >= ?", (cutoff, S("MIN_SCORE"))).fetchone()[0]
+        r_low     = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL AND score IS NOT NULL AND score < ?", (cutoff, S("MIN_SCORE"))).fetchone()[0]
+        r_unscored= c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL AND score IS NULL", (cutoff,)).fetchone()[0]
 
         buckets = c.execute("""
             SELECT MIN(CAST(score/10 AS INTEGER), 9) * 10 AS bucket,
@@ -2199,11 +2269,18 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📊 Stats\n"
         f"\n"
         f"Total in DB: {total}\n"
-        f"  Too old to show: {too_old}\n"
+        f"  Too old to show (pre-{S('ARTICLE_MAX_AGE_DAYS')}d): {too_old}\n"
         f"  Recent ({S('ARTICLE_MAX_AGE_DAYS')}d{last_fetch}): {recent}\n"
         f"\n"
-        f"Recent breakdown:\n"
-        f"  ✓ Liked: {r_shared}\n"
+        f"Too old breakdown ({too_old}):\n"
+        f"  ✓ Liked: {t_liked}\n"
+        f"  ✗ Explicitly disliked: {t_disliked}\n"
+        f"  ➖ Auto-ignored (no reaction): {t_ignored}\n"
+        f"  Seen (sent, no vote): {t_sent}\n"
+        f"  Unseen — see /unseen: {t_ready}\n"
+        f"\n"
+        f"Recent breakdown ({recent}):\n"
+        f"  ✓ Liked: {r_liked}\n"
         f"  ✗ Explicitly disliked: {r_disliked}\n"
         f"  ➖ Auto-ignored (no reaction): {r_ignored}\n"
         f"  Seen (sent, no vote): {r_sent}\n"
@@ -2221,6 +2298,7 @@ async def cmd_commands(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(  # type: ignore[union-attr]
         f"/feed [n]    — scored digest (default {S('TOP_N')})\n"
         f"/digest      — compact daily digest (new + unseen)\n"
+        f"/unseen [n]  — old articles too old for /feed, never seen\n"
         "/fetch       — fetch new articles from feeds\n"
         "/scoreall    — score all unscored articles\n"
         "/model NAME   — switch LLM model (persists to .env)\n"
@@ -2589,6 +2667,7 @@ def main():
     app.add_handler(CommandHandler("start",    cmd_start,     filters=owner))
     app.add_handler(CommandHandler("feed",     cmd_feed,      filters=owner))
     app.add_handler(CommandHandler("digest",   cmd_digest,    filters=owner))
+    app.add_handler(CommandHandler("unseen",   cmd_unseen,    filters=owner))
     app.add_handler(CommandHandler("fetch",    cmd_fetch,     filters=owner))
     app.add_handler(CommandHandler("profile",  cmd_profile,   filters=owner))
     app.add_handler(CommandHandler("remember", cmd_remember,  filters=owner))

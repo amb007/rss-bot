@@ -78,6 +78,7 @@ profile**, which the bot uses when scoring new articles.
 | Command | What it does |
 |---|---|
 | `/feed` | Show your current best articles right now (instead of waiting for the daily digest). Add a number to change the count, e.g. `/feed 5`. |
+| `/unseen` | Show old articles that were never seen and are now too old for `/feed` (the backlog `/feed` can't reach). Add a count, e.g. `/unseen 5`. |
 | `/digest` | Pull the compact daily digest now (new + unseen articles) instead of waiting for the scheduled push |
 | `/fetch` | Pull the newest articles from your subscribed feeds now (usually you don't need to — the bot does this itself every 30 minutes) |
 | `/scoreall` | Force-score everything that isn't scored yet (e.g. right after setup). Usually not needed. |
@@ -89,7 +90,7 @@ profile**, which the bot uses when scoring new articles.
 | `/backend [NAME]` | Switch which LLM backend does the scoring (switches the model with it). Only backends configured in `.env` are accepted; without a NAME it lists them. |
 | `/models` | List models discovered across your configured backends, with SWE-bench score and last-probe health. `/models refresh` re-discovers + re-probes now. |
 | `/automodel on\|off` | When on (default), a dead model auto-switches to the best live free model across your backends. |
-| `/stats` | The bot's stats — total articles, how many are new, scored, ignored... Good for checking what's going on. |
+| `/stats` | The bot's stats — total articles, plus an **Unseen** split: how many are too old for `/feed` (viewable via `/unseen`) vs new-and-not-yet-shown, plus liked/disliked/ignored/scored counts and a score histogram |
 | `/addfeed https://...` | Subscribe to a new RSS/Atom feed. You can also paste an article or homepage URL — the bot finds the real feed automatically |
 | `/removefeed [url]` | Unsubscribe. Two ways: reply to any article message (the bot finds its source feed) or pass the URL. |
 | `/search QUERY` | Full-text search over everything the bot has stored (try `/search openai`, `/search nba`) |
