@@ -2697,9 +2697,11 @@ def main():
         scheduler = AsyncIOScheduler()
         scheduler_holder["job"] = scheduler
         phase = instance_phase_offset_seconds()
-        scheduler.add_job(hourly_job, "interval", minutes=30, args=[application],
-                          next_run_time=datetime.now(timezone.utc) + timedelta(seconds=phase))
+        # immediate first fetch on startup
+        scheduler.add_job(hourly_job, "date", run_date=datetime.now(timezone.utc) + timedelta(seconds=phase), args=[application])
         scheduler.add_job(daily_digest_job, "cron", hour=S("DIGEST_HOUR"), args=[application])
+        # recurring fetches at :30 of every hour, ensuring a fetch at DIGEST_HOUR-30min
+        scheduler.add_job(hourly_job, "cron", minute=30, args=[application])
         scheduler.add_job(swe_refresh_job, "interval", days=max(1, S("SWE_REFRESH_DAYS")),
                           args=[application], next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30))
         scheduler.add_job(probe_models_job, "interval", hours=max(1, S("MODEL_PROBE_INTERVAL_H")),
