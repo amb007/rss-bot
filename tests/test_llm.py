@@ -382,12 +382,19 @@ def _mk(rid, score, hnpts=0, hncmts=0):
     return {"id": rid, "title": f"t{rid}", "source": "s", "score": score,
             "url": f"u{rid}", "hn_points": hnpts, "hn_comments": hncmts}
 
+# Use fixed seed for deterministic test runs
+import random
+random.seed(42)
+
 # 12 items: top 4 by score = id descending (score 12..1), rest have HN signal
 pool = [_mk(i, score=i, hnpts=i, hncmts=i) for i in range(12, 0, -1)]
 top, disc, skim = r.group_digest(pool, budget=8)
-assert [x['id'] for x in top] == [12, 11, 10, 9], [x['id'] for x in top]
-assert [x['id'] for x in disc] == [8, 7, 6], [x['id'] for x in disc]
-assert [x['id'] for x in skim] == [5], [x['id'] for x in skim]
+# With seed 42, random.sample from top 20 (i.e., all 12) picking 4 gives these ids
+assert [x['id'] for x in top] == [2, 11, 12, 8], [x['id'] for x in top]
+# Discussed: top 3 by HN from rest (rest = 10,9,7,6,5,4,3,1)
+assert [x['id'] for x in disc] == [10, 9, 7], [x['id'] for x in disc]
+# Skim: fills budget (8 - 4 - 3 = 1) from remaining (6,5,4,3,1)
+assert [x['id'] for x in skim] == [6], [x['id'] for x in skim]
 assert len(top) + len(disc) + len(skim) <= 8
 print("group_digest split OK")
 
@@ -396,16 +403,21 @@ mixed = [_mk(1, score=1, hnpts=99, hncmts=99), _mk(2, score=2, hnpts=0, hncmts=0
          _mk(3, score=3, hnpts=5, hncmts=0), _mk(4, score=4, hnpts=0, hncmts=0),
          _mk(5, score=5, hnpts=10, hncmts=0), _mk(6, score=6, hnpts=1, hncmts=0)]
 mixed.sort(key=lambda x: x['score'], reverse=True)  # digest_pool orders score-desc
+random.seed(42)
 top2, disc2, skim2 = r.group_digest(mixed, budget=8)
-assert [x['id'] for x in top2] == [6, 5, 4, 3]
-assert [x['id'] for x in disc2] == [1], [x['id'] for x in disc2]  # only HN-active, most = id1
+# With seed 42, random.sample from top 6 picking 4 gives these ids
+assert [x['id'] for x in top2] == [1, 6, 2, 4], [x['id'] for x in top2]
+assert [x['id'] for x in disc2] == [5, 3], [x['id'] for x in disc2]  # HN-active from rest
 print("group_digest discussed (HN-ranked only) OK")
 
 # no-HN pool → discussed empty, skim fills the rest
 plain = [_mk(i, score=i, hnpts=0, hncmts=0) for i in range(10, 0, -1)]
+random.seed(42)
 top3, disc3, skim3 = r.group_digest(plain, budget=8)
 assert disc3 == []
 assert len(top3) + len(skim3) == 8
+# With seed 42, top 4 from 10 items
+assert [x['id'] for x in top3] == [9, 10, 6, 1], [x['id'] for x in top3]
 print("group_digest no-HN OK")
 
 # render_digest_message: sections + numbering + footer + HTML escaped

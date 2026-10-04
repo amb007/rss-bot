@@ -129,8 +129,10 @@ results instead of an error).
 | KEY | Meaning | Default |
 |---|---|---|
 | `TOP_N` | How many articles appear in a `/feed` (add `N` to view more) | `8` |
-| `DIGEST_TOP` | How many articles appear in the daily digest message | `8` |
-| `DIGEST_THEME` | Turn the "today's theme" opener in the digest on/off (`0` to disable) | `1` |
+| `DIGEST_TOTAL_ARTICLES` | Total articles in the digest message (top + discussed + skim) | `8` |
+| `DIGEST_TOP_PICKS` | Number of articles in "🔥 Top picks" (random sample from top 20) | `4` |
+| `DIGEST_TEXT_BUDGET` | How many top-scoring articles the LLM analyzes for the theme opener | `5` |
+| `DIGEST_THEME_LINES` | Lines in the theme opener (`0` = disable, `N>0` = N lines) | `2` |
 | `MIN_SCORE` | Minimum score for an article to make the digest (raise if you get too much fluff, lower if too little) | `10` |
 | `DIGEST_HOUR` | Hour (0–23) when the daily digest is pushed | `8` |
 | `IGNORE_AFTER_H` | Ignore articles older than this many hours | `12` |
@@ -170,8 +172,8 @@ changes, check with `/get` whether the value was accepted.
   interests and keep reaction- 👍 articles; it learns fast.
 - **"I don't want that feed anymore."** → Reply to an article from it and send
   `/removefeed` hands-free, or `/removefeed https://the.feed.url`.
-- **"Too much noise."** → Raise `MIN_SCORE` and/or shrink `DIGEST_TOP` (digest)
-  or `TOP_N` (`/feed`): `/set MIN_SCORE 15`, `/set DIGEST_TOP 5`, `/set TOP_N 15`.
+- **"Too much noise."** → Raise `MIN_SCORE` and/or shrink `DIGEST_TOTAL_ARTICLES` (digest)
+  or `TOP_N` (`/feed`): `/set MIN_SCORE 15`, `/set DIGEST_TOTAL_ARTICLES 5`, `/set TOP_N 15`.
 
 ---
 

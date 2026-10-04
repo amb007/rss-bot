@@ -118,8 +118,10 @@ app.add_handler(MessageReactionHandler(handle_reaction, chat_id=TELEGRAM_CHAT_ID
 | `DIGEST_HOUR` | `8` | Hour of day to push the daily digest (24h) |
 | `IGNORE_AFTER_H` | `12` | Article age (h) before it's ignored by the digest |
 | `TOP_N` | `8` | Max articles shown in `/feed` |
-| `DIGEST_TOP` | `8` | Max articles shown in the daily digest message |
-| `DIGEST_THEME` | `1` | 2-line LLM "today's theme" opener at the top of the digest (`0` to disable) |
+| `DIGEST_TOTAL_ARTICLES` | `8` | Total articles in the digest message (top + discussed + skim) |
+| `DIGEST_TOP_PICKS` | `4` | Number of articles in "🔥 Top picks" (random sample from top 20) |
+| `DIGEST_TEXT_BUDGET` | `5` | How many top-scoring articles the LLM analyzes for the theme opener |
+| `DIGEST_THEME_LINES` | `2` | Lines in the theme opener (`0` to disable, `N>0` for N lines) |
 | `MIN_SCORE` | `10` | Minimum LLM score for a "keep" article |
 | `PROFILE_EXAMPLES` | `30` | Number of saved-article examples used to derive the interest profile |
 | `SCORE_BATCH` | `10` | Articles scored per LLM batch |
@@ -204,13 +206,14 @@ Runs on a scheduler inside the same process (APScheduler):
    articles (`score >= MIN_SCORE`, not yet `sent_at`, published after the last
    digest) and push a compact grouped message to `TELEGRAM_CHAT_ID` through
    `send_digest()`. It renders one message with a short **LLM "today's theme"**
-   opener (when `DIGEST_THEME` is on), then up to `DIGEST_TOP` articles grouped
-   into **🔥 Top picks** (interest score) and, when an HN-compatible feed is
-   used (`*ycombinator.com*` / `*hnrss.org*`), **💬 Most discussed** by live
-   Hacker News votes pulled from `https://hnrss.org/frontpage`. Shown articles
-   stay unread (no `sent_at` set), so you can still
-   👍/👎 them in `/feed`; the digest window advances via the `last_digest`
-   setting so nothing is re-offered next run.
+   opener (`DIGEST_THEME_LINES` lines; `0` to disable), then up to
+   `DIGEST_TOTAL_ARTICLES` articles grouped into **🔥 Top picks** (random sample
+   from top 20 by score, count `DIGEST_TOP_PICKS`), and when an HN-compatible
+   feed is used (`*ycombinator.com*` / `*hnrss.org*`), **💬 Most discussed** by
+   live Hacker News votes pulled from `https://hnrss.org/frontpage`. The
+   remaining slots fill **📚 Worth a skim**. Shown articles stay unread (no
+   `sent_at` set), so you can still 👍/👎 them in `/feed`; the digest window
+   advances via the `last_digest` setting so nothing is re-offered next run.
 3. Errors during the hourly job are pushed straight to the owner's chat.
 
 The scraper, scoring, and search are all local — no cloud LLM needed if you

@@ -78,7 +78,10 @@ def instance_phase_offset_seconds() -> int:
 SETTING_DEFAULTS = {
     "DIGEST_HOUR":          "8",
     "DIGEST_TOP":           "8",
-    "DIGEST_THEME":         "1",
+    "DIGEST_TOTAL_ARTICLES": "8",
+    "DIGEST_TEXT_BUDGET":   "5",
+    "DIGEST_TOP_PICKS":     "4",
+    "DIGEST_THEME_LINES":   "2",
     "IGNORE_AFTER_H":       "12",
     "TOP_N":                "8",
     "MIN_SCORE":            "10",
@@ -1445,11 +1448,16 @@ def digest_pool() -> list[dict]:
 def _digest_hn(r) -> int:
     return (r.get("hn_points") or 0) + (r.get("hn_comments") or 0)
 
-def group_digest(pool: list[dict], budget: int = 8):
+def group_digest(pool: list[dict], budget: int = 8, top_n: int = 4):
     """Split the digest pool into (top_picks, discussed, skim) sections.
-    Top picks = highest score; discussed = most HN-active; the rest skim.
-    Never returns more than `budget` rows total."""
-    top = pool[:4]
+    Top picks = random sample from top 20 by score; discussed = most HN-active;
+    the rest skim. Never returns more than `budget` rows total."""
+    # Randomize top picks: sample from top 20 (or all if fewer) instead of
+    # always taking the absolute top N. This adds variety across digests and
+    # prevents /feed from always starting with the same articles.
+    import random
+    candidate_pool = pool[:20]  # consider top 20 by score
+    top = random.sample(candidate_pool, min(top_n, len(candidate_pool)))
     top_ids = {r["id"] for r in top}
     rest = [r for r in pool if r["id"] not in top_ids]
     with_hn = [r for r in rest if _digest_hn(r) > 0]
@@ -1545,18 +1553,23 @@ def _overlay_hn_scores(pool: list[dict], hn: dict) -> None:
             r["hn_points"] = hit.get("points", 0)
             r["hn_comments"] = hit.get("comments", 0)
 
-async def _digest_theme(top: list[dict]) -> str:
-    """2-line LLM opener summarizing what today's top picks are about.
-    Best-effort: returns "" on failure or when DISABLED via DIGEST_THEME=0."""
-    if not top or not S("DIGEST_THEME"):
+async def _digest_theme(pool: list[dict]) -> str:
+    """N-line LLM opener summarizing what today's top articles are about.
+    Best-effort: returns "" when DIGEST_THEME_LINES=0.
+    Analyzes the top DIGEST_TEXT_BUDGET articles by score from the pool."""
+    if not pool:
         return ""
-    ctx = "\n".join(f"• {r['title']} ({r.get('source')})" for r in top[:5])
+    n_lines = int(S("DIGEST_THEME_LINES"))
+    if n_lines <= 0:
+        return ""
+    top_by_score = pool[:int(S("DIGEST_TEXT_BUDGET"))]
+    ctx = "\n".join(f"• {r['title']} ({r.get('source')})" for r in top_by_score)
     try:
         reply = await llm_chat([{"role": "user", "content":
-            "In 2 short lines, summarize the common theme of today's top news "
-            "picks and why they matter. No markdown, no intro, 2 lines max.\n\n"
+            f"In {n_lines} short lines, summarize the common theme of today's top news "
+            f"picks and why they matter. No markdown, no intro, {n_lines} lines max.\n\n"
             + ctx}], max_tokens=120, retries=2)
-        return "\n".join(x.strip() for x in (reply or "").splitlines()[:2]).strip()
+        return "\n".join(x.strip() for x in (reply or "").splitlines()[:n_lines]).strip()
     except Exception as e:
         logging.warning(f"digest theme failed: {e}")
         return ""
@@ -1575,8 +1588,10 @@ async def send_digest(bot, chat_id: int) -> int:
         hn = await _fetch_hnrss_overlay()
         if hn:
             _overlay_hn_scores(pool, hn)
-    top, discussed, skim = group_digest(pool, budget=int(S("DIGEST_TOP")))
-    theme = await _digest_theme(top)
+    top, discussed, skim = group_digest(pool,
+                                  budget=int(S("DIGEST_TOTAL_ARTICLES")),
+                                  top_n=int(S("DIGEST_TOP_PICKS")))
+    theme = await _digest_theme(pool)
     shown = top + discussed + skim
     await tg_send(bot.send_message, chat_id=chat_id,
                   text=render_digest_message(top, discussed, skim, len(pool), theme),
