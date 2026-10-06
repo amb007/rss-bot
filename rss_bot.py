@@ -1567,9 +1567,14 @@ async def _digest_theme(pool: list[dict]) -> str:
     try:
         reply = await llm_chat([{"role": "user", "content":
             f"In {n_lines} short lines, summarize the common theme of today's top news "
-            f"picks and why they matter. No markdown, no intro, {n_lines} lines max.\n\n"
+            f"picks and why they matter. No markdown, no intro, {n_lines} lines max.\n"
+            f"Output ONLY the summary lines, nothing else.\n\n"
             + ctx}], max_tokens=120, retries=2)
-        return "\n".join(x.strip() for x in (reply or "").splitlines()[:n_lines]).strip()
+        logging.info(f"digest theme raw reply: {reply!r}")
+        lines = [x.strip() for x in (reply or "").splitlines() if x.strip()]
+        # Filter out lines that look like prompt leakage
+        filtered = [ln for ln in lines if not ln.lower().startswith(('in ', 'output', 'summarize', 'no markdown', 'today\'s', 'picks'))]
+        return "\n".join(filtered[:n_lines]).strip()
     except Exception as e:
         logging.warning(f"digest theme failed: {e}")
         return ""
