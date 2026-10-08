@@ -1571,12 +1571,24 @@ async def _digest_theme(pool: list[dict]) -> str:
             f"Output ONLY the summary lines. No reasoning, no thinking, no step-by-step.\n\n"
             + ctx}], max_tokens=120, retries=2)
         logging.info(f"digest theme raw reply: {reply!r}")
-        lines = [x.strip() for x in (reply or "").splitlines() if x.strip()]
+        # Split into lines first; if single line, split on sentences
+        raw_lines = [x.strip() for x in (reply or "").splitlines() if x.strip()]
+        if len(raw_lines) == 1:
+            # Model output all in one line — split on sentence boundaries
+            import re
+            raw_lines = [s.strip() for s in re.split(r'(?<=[.!?])\s+', raw_lines[0]) if s.strip()]
         # Filter out lines that look like prompt leakage, reasoning, or thinking
         reasoning_starts = ('in ', 'output', 'summarize', 'no markdown', 'today\'s', 'picks',
                             'we need', 'need ', 'ensure', 'first line', 'second line',
-                            'think', 'reason', 'step', 'infer', 'must', 'should')
-        filtered = [ln for ln in lines if not ln.lower().startswith(reasoning_starts)]
+                            'think', 'reason', 'step', 'infer', 'must', 'should',
+                            'could say', 'could be', 'would say', 'would be')
+        filtered = [ln for ln in raw_lines if not ln.lower().startswith(reasoning_starts)]
+        # If filtering removed everything, try to salvage quoted summary sentences
+        if not filtered and raw_lines:
+            import re
+            quoted = re.findall(r'"([^"]+)"', raw_lines[0])
+            if quoted:
+                filtered = [q.strip() for q in quoted if q.strip()]
         return "\n".join(filtered[:n_lines]).strip()
     except Exception as e:
         logging.warning(f"digest theme failed: {e}")
