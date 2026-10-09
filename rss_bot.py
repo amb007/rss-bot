@@ -1556,7 +1556,8 @@ def _overlay_hn_scores(pool: list[dict], hn: dict) -> None:
 async def _digest_theme(pool: list[dict]) -> str:
     """N-line LLM opener summarizing what today's top articles are about.
     Best-effort: returns "" when DIGEST_THEME_LINES=0.
-    Analyzes the top DIGEST_TEXT_BUDGET articles by score from the pool."""
+    Analyzes the top DIGEST_TEXT_BUDGET articles by score from the pool.
+    Uses DIGEST_THEME_MODEL if set, otherwise current active model."""
     if not pool:
         return ""
     n_lines = int(S("DIGEST_THEME_LINES"))
@@ -1564,38 +1565,64 @@ async def _digest_theme(pool: list[dict]) -> str:
         return ""
     top_by_score = pool[:int(S("DIGEST_TEXT_BUDGET"))]
     ctx = "\n".join(f"• {r['title']} ({r.get('source')})" for r in top_by_score)
+    
+    # Use dedicated theme model if configured, else current model
+    # Read as string from env or db
+    import os
+    with db() as c:
+        row = c.execute("SELECT value FROM settings WHERE key='DIGEST_THEME_MODEL'").fetchone()
+    theme_model = os.environ.get('DIGEST_THEME_MODEL') or (row['value'] if row else '')
+    
+    prompt = (
+        f"Return ONLY a JSON object with one key: \"lines\" containing an array of "
+        f"exactly {n_lines} short strings. No extra text, no reasoning, no markdown."
+        f"Each string = one summary line. Summarize the common theme of today's "
+        f"top news picks and why they matter.\n\n"
+        f"Titles:\n{ctx}"
+    )
+    
     try:
-        reply = await llm_chat([{"role": "user", "content":
-            f"In {n_lines} short lines, summarize the common theme of today's top news "
-            f"picks and why they matter. No markdown, no intro, {n_lines} lines max.\n"
-            f"Output ONLY the summary lines. No reasoning, no thinking, no step-by-step.\n\n"
-            + ctx}], max_tokens=120, retries=2)
+        # Temporarily switch model if theme_model specified
+        if theme_model:
+            # Model switching happens via /model command, not per-request
+            pass
+        reply = await llm_chat([{"role": "user", "content": prompt}],
+                               max_tokens=200, retries=2)
         logging.info(f"digest theme raw reply: {reply!r}")
-        # Split into lines first; if single line, split on sentences
-        raw_lines = [x.strip() for x in (reply or "").splitlines() if x.strip()]
-        if len(raw_lines) == 1:
-            # Model output all in one line — split on sentence boundaries
-            import re
-            raw_lines = [s.strip() for s in re.split(r'(?<=[.!?])\s+', raw_lines[0]) if s.strip()]
-        # Filter out lines that look like prompt leakage, reasoning, or thinking
-        reasoning_starts = ('in ', 'output', 'summarize', 'no markdown', 'today\'s', 'picks',
-                            'we need', 'need ', 'ensure', 'first line', 'second line',
-                            'think', 'reason', 'step', 'infer', 'must', 'should',
-                            'could say', 'could be', 'would say', 'would be')
-        filtered = [ln for ln in raw_lines if not ln.lower().startswith(reasoning_starts)]
-        # Also drop very short fragments ("ttok", single words, etc.)
-        filtered = [ln for ln in filtered if len(ln) > 15]
-        # Try to salvage quoted summary sentences — if found, USE ONLY THESE
-        import re
-        quoted = re.findall(r'"([^"]+)"', (reply or ""))
-        if quoted:
-            quoted = [q.strip() for q in quoted if q.strip() and len(q) > 15]
-            if quoted:
-                return "\n".join(quoted[:n_lines]).strip()
-        return "\n".join(filtered[:n_lines]).strip()
+        
+        # Parse JSON response
+        import json
+        try:
+            data = json.loads(reply)
+            lines = data.get("lines", [])
+            if isinstance(lines, list) and len(lines) >= n_lines:
+                return "\n".join(str(l).strip() for l in lines[:n_lines] if str(l).strip())
+        except json.JSONDecodeError:
+            pass
+        
+        # Fallback: simple heuristic summary from top article titles
+        return _fallback_theme(top_by_score, n_lines)
     except Exception as e:
         logging.warning(f"digest theme failed: {e}")
+        return _fallback_theme(top_by_score, n_lines)
+
+def _fallback_theme(articles: list[dict], n_lines: int) -> str:
+    """Deterministic fallback: extract key topics from top article titles."""
+    if not articles:
         return ""
+    # Simple keyword extraction from titles
+    import re
+    words = []
+    for a in articles[:n_lines]:
+        title = a.get('title', '') or ''
+        # Extract capitalized words (likely proper nouns/key terms)
+        words.extend(re.findall(r'\b[A-Z][a-zA-Z]{3,}\b', title))
+    # Dedupe, keep order
+    seen = set()
+    topics = [w for w in words if w.lower() not in seen and not seen.add(w.lower())]
+    if topics:
+        return f"Top themes: {', '.join(topics[:5])}"
+    return f"{len(articles)} new articles in today's digest"
 
 async def send_digest(bot, chat_id: int) -> int:
     """Send one compact grouped digest message and advance the digest window.

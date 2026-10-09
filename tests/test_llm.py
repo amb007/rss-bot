@@ -626,4 +626,48 @@ finally:
     r.asyncio.sleep = _orig_sleep
     r._hnrss_cache = {}
 
+# --- digest theme: JSON parsing + fallback ---
+# Test JSON parsing success
+class _MockLLMChat:
+    def __init__(self, reply):
+        self.reply = reply
+    async def __call__(self, messages, max_tokens=512, retries=None):
+        return self.reply
+
+# Save original and replace
+_orig_llm_chat = r.llm_chat
+
+# Test 1: Valid JSON with correct lines
+r.llm_chat = _MockLLMChat('{"lines": ["First theme line", "Second theme line"]}')
+pool = [{"title": "AI is big", "source": "tech"}, {"title": "Rust is fast", "source": "dev"}]
+result = _asyncio.run(r._digest_theme(pool))
+assert result == "First theme line\nSecond theme line", f"Got: {result!r}"
+print("_digest_theme JSON parsing OK")
+
+# Test 2: JSON but missing lines key → fallback
+r.llm_chat = _MockLLMChat('{"other": "data"}')
+result = _asyncio.run(r._digest_theme(pool))
+assert result.startswith("Top themes:") or result.startswith("2 new articles"), f"Got: {result!r}"
+print("_digest_theme missing lines key → fallback OK")
+
+# Test 3: Invalid JSON → fallback
+r.llm_chat = _MockLLMChat('not json at all')
+result = _asyncio.run(r._digest_theme(pool))
+assert result.startswith("Top themes:") or result.startswith("2 new articles"), f"Got: {result!r}"
+print("_digest_theme invalid JSON → fallback OK")
+
+# Test 4: Empty pool → empty string
+result = _asyncio.run(r._digest_theme([]))
+assert result == ""
+print("_digest_theme empty pool OK")
+
+# Test 5: DIGEST_THEME_LINES = 0 → empty string
+# We can't easily test this without mocking S(), but we test fallback directly
+fallback = r._fallback_theme(pool, 2)
+assert fallback.startswith("Top themes:") or fallback.startswith("2 new articles")
+print("_fallback_theme OK")
+
+# Restore
+r.llm_chat = _orig_llm_chat
+
 print("ALL TESTS PASSED")
