@@ -1583,12 +1583,15 @@ async def _digest_theme(pool: list[dict]) -> str:
                             'think', 'reason', 'step', 'infer', 'must', 'should',
                             'could say', 'could be', 'would say', 'would be')
         filtered = [ln for ln in raw_lines if not ln.lower().startswith(reasoning_starts)]
-        # If filtering removed everything, try to salvage quoted summary sentences
-        if not filtered and raw_lines:
-            import re
-            quoted = re.findall(r'"([^"]+)"', raw_lines[0])
+        # Also drop very short fragments ("ttok", single words, etc.)
+        filtered = [ln for ln in filtered if len(ln) > 15]
+        # Try to salvage quoted summary sentences — if found, USE ONLY THESE
+        import re
+        quoted = re.findall(r'"([^"]+)"', (reply or ""))
+        if quoted:
+            quoted = [q.strip() for q in quoted if q.strip() and len(q) > 15]
             if quoted:
-                filtered = [q.strip() for q in quoted if q.strip()]
+                return "\n".join(quoted[:n_lines]).strip()
         return "\n".join(filtered[:n_lines]).strip()
     except Exception as e:
         logging.warning(f"digest theme failed: {e}")
