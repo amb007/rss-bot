@@ -53,6 +53,9 @@ load_dotenv(RSS_DIR / ".env")
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
+...
+FEEDS_FILE = Path(os.environ.get("FEEDS_FILE", str(RSS_DIR / "feeds.txt")))
+DB_PATH    = RSS_DIR / "rss_bot.db"
 ```
 
 ---

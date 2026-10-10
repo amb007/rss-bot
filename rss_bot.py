@@ -82,6 +82,7 @@ SETTING_DEFAULTS = {
     "DIGEST_TEXT_BUDGET":   "5",
     "DIGEST_TOP_PICKS":     "4",
     "DIGEST_THEME_LINES":   "2",
+    "DIGEST_THEME_MODEL":   "",
     "IGNORE_AFTER_H":       "12",
     "TOP_N":                "8",
     "MIN_SCORE":            "10",
@@ -98,6 +99,11 @@ SETTING_DEFAULTS = {
     "MODEL_PROBE_REFRESH_HOURS": "6",   # "ok" probe older than this is stale
     "MODEL_PROBE_INTERVAL_H": "24",    # how often to proactively re-probe
     "PROBE_BATCH":               "5",   # models probed per proactive refresh
+}
+
+# Settings that are strings (not converted to int/float)
+STRING_SETTINGS = {
+    "DIGEST_THEME_MODEL",
 }
 
 # URL rewrite: feed servers that return wrong article links.
@@ -328,14 +334,29 @@ def load_settings() -> dict:
         env_val = os.environ.get(key)
         val = env_val if env_val is not None else db_rows.get(key, default)
         try:
-            result[key] = float(val) if key == "MIN_SCORE" else int(val)
+            if key == "MIN_SCORE":
+                result[key] = float(val)
+            elif key in STRING_SETTINGS:
+                result[key] = str(val)
+            else:
+                result[key] = int(val)
         except (ValueError, TypeError) as e:
             db_val = db_rows.get(key) if key in db_rows else None
             try:
-                result[key] = float(db_val) if key == "MIN_SCORE" else int(db_val)  # type: ignore[arg-type]
+                if key == "MIN_SCORE":
+                    result[key] = float(db_val)
+                elif key in STRING_SETTINGS:
+                    result[key] = str(db_val)
+                else:
+                    result[key] = int(db_val)  # type: ignore[arg-type]
                 logging.error(f"Settings: invalid {key}={val!r}, using db value: {e}")
             except Exception:
-                result[key] = float(default) if key == "MIN_SCORE" else int(default)
+                if key == "MIN_SCORE":
+                    result[key] = float(default)
+                elif key in STRING_SETTINGS:
+                    result[key] = str(default)
+                else:
+                    result[key] = int(default)
                 logging.error(f"Settings: invalid {key}={val!r}, using default: {e}")
     with db() as c:
         for key, val in result.items():
@@ -346,7 +367,11 @@ def get_setting(key: str):
     with db() as c:
         row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     val = row["value"] if row else SETTING_DEFAULTS[key]
-    return float(val) if key == "MIN_SCORE" else int(val)
+    if key == "MIN_SCORE":
+        return float(val)
+    if key in STRING_SETTINGS:
+        return val
+    return int(val)
 
 def set_setting(key: str, value) -> bool:
     if key not in SETTING_DEFAULTS:
@@ -1583,11 +1608,28 @@ async def _digest_theme(pool: list[dict]) -> str:
     
     try:
         # Temporarily switch model if theme_model specified
-        if theme_model:
-            # Model switching happens via /model command, not per-request
-            pass
-        reply = await llm_chat([{"role": "user", "content": prompt}],
-                               max_tokens=200, retries=2)
+        theme_backend = theme_model.split(':')[0] if theme_model and ':' in theme_model else None
+        theme_model_id = theme_model.split(':')[1] if theme_model and ':' in theme_model else None
+        
+        original_backend = None
+        original_model = None
+        if theme_backend and theme_model_id:
+            # Save original state
+            original_backend = current_llm_backend()
+            original_model = current_llm_model()
+            # Switch to theme model
+            set_llm_backend(theme_backend)
+            set_llm_model(theme_model_id)
+        
+        try:
+            reply = await llm_chat([{"role": "user", "content": prompt}],
+                                   max_tokens=200, retries=2)
+        finally:
+            # Restore original model
+            if original_backend and original_model:
+                set_llm_backend(original_backend)
+                set_llm_model(original_model)
+        
         logging.info(f"digest theme raw reply: {reply!r}")
         
         # Parse JSON response

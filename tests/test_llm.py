@@ -670,6 +670,81 @@ print("_fallback_theme OK")
 # Restore
 r.llm_chat = _orig_llm_chat
 
+# --- _digest_theme: model switching tests ---
+# Test that DIGEST_THEME_MODEL triggers model switch and restore
+# Mock set_llm_backend and set_llm_model to track calls
+_orig_set_llm_backend = r.set_llm_backend
+_orig_set_llm_model = r.set_llm_model
+_orig_current_llm_backend = r.current_llm_backend
+_orig_current_llm_model = r.current_llm_model
+
+backend_calls = []
+model_calls = []
+def _mock_set_llm_backend(b):
+    backend_calls.append(b)
+    return _orig_set_llm_backend(b)
+def _mock_set_llm_model(m):
+    model_calls.append(m)
+    return _orig_set_llm_model(m)
+r.set_llm_backend = _mock_set_llm_backend
+r.set_llm_model = _mock_set_llm_model
+
+# Set a theme model
+r.set_setting("DIGEST_THEME_MODEL", "nim:meta/llama-3.1-8b-instruct")
+
+# Mock llm_chat to succeed
+r.llm_chat = _MockLLMChat('{"lines": ["Test line 1", "Test line 2"]}')
+pool = [{"title": "AI is big", "source": "tech"}]
+result = _asyncio.run(r._digest_theme(pool))
+assert result == "Test line 1\nTest line 2"
+# Verify model switch happened
+assert "nim" in backend_calls, f"Expected 'nim' in backend_calls, got {backend_calls}"
+assert "meta/llama-3.1-8b-instruct" in model_calls, f"Expected model in model_calls, got {model_calls}"
+# Verify restore - original backend/model should be restored
+# (The test environment starts with zen backend)
+assert r.current_llm_backend() == "zen", f"Backend not restored, got {r.current_llm_backend()}"
+print("_digest_theme model switch + restore OK")
+
+# Test model restore on error
+backend_calls.clear()
+model_calls.clear()
+r.llm_chat = _MockLLMChat('this will raise')
+# Make llm_chat raise an exception
+async def _failing_llm_chat(*a, **k):
+    raise ValueError("test error")
+r.llm_chat = _failing_llm_chat
+try:
+    _asyncio.run(r._digest_theme(pool))
+except ValueError:
+    pass
+# Even on error, model should be restored
+assert r.current_llm_backend() == "zen", f"Backend not restored after error, got {r.current_llm_backend()}"
+print("_digest_theme model restore on error OK")
+
+# Test: no theme model set -> uses current model (no switch)
+backend_calls.clear()
+model_calls.clear()
+r.set_setting("DIGEST_THEME_MODEL", "")  # empty
+r.llm_chat = _MockLLMChat('{"lines": ["Test line 1", "Test line 2"]}')
+result = _asyncio.run(r._digest_theme(pool))
+print(f"DEBUG: result={result!r}")  # DEBUG
+assert result == "Test line 1\nTest line 2", f"Expected two lines, got {result!r}"
+assert len(backend_calls) == 0, f"Expected no backend switch, got {backend_calls}"
+assert len(model_calls) == 0, f"Expected no model switch, got {model_calls}"
+print("_digest_theme no theme model -> no switch OK")
+
+# Restore all
+r.llm_chat = _orig_llm_chat
+r.set_llm_backend = _orig_set_llm_backend
+r.set_llm_model = _orig_set_llm_model
+r.current_llm_backend = _orig_current_llm_backend
+r.current_llm_model = _orig_current_llm_model
+
+print("_digest_theme model switching tests OK")
+
+# Restore
+r.llm_chat = _orig_llm_chat
+
 # --- thememodel: render + callback ---
 # Test that render_thememodels_page can be called without error (smoke test)
 # We mock the bot send_message to avoid actual Telegram calls
