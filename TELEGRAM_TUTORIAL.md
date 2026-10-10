@@ -89,6 +89,7 @@ profile**, which the bot uses when scoring new articles.
 | `/model [NAME]` | Change or view the model used for scoring. Without a NAME it shows the current one. Persists to `.env` as the active backend's `<BACKEND>_MODEL`. |
 | `/backend [NAME]` | Switch which LLM backend does the scoring (switches the model with it). Only backends configured in `.env` are accepted; without a NAME it lists them. |
 | `/models` | List models discovered across your configured backends, with SWE-bench score and last-probe health. `/models refresh` re-discovers + re-probes now. |
+| `/thememodel` | Browse models and pick one for the digest theme opener. Stores `backend:model_id` in `DIGEST_THEME_MODEL`. `/thememodel refresh` re-discovers + re-probes. |
 | `/automodel on\|off` | When on (default), a dead model auto-switches to the best live free model across your backends. |
 | `/stats` | The bot's stats — total articles, plus an **Unseen** split: how many are too old for `/feed` (viewable via `/unseen`) vs new-and-not-yet-shown, plus liked/disliked/ignored/scored counts and a score histogram |
 | `/addfeed https://...` | Subscribe to a new RSS/Atom feed. You can also paste an article or homepage URL — the bot finds the real feed automatically |
@@ -133,6 +134,7 @@ results instead of an error).
 | `DIGEST_TOP_PICKS` | Number of articles in "🔥 Top picks" (random sample from top 20) | `4` |
 | `DIGEST_TEXT_BUDGET` | How many top-scoring articles the LLM analyzes for the theme opener | `5` |
 | `DIGEST_THEME_LINES` | Lines in the theme opener (`0` = disable, `N>0` = N lines) | `2` |
+| `DIGEST_THEME_MODEL` | Dedicated model for the theme opener (`backend:model_id`); set via `/thememodel` | `""` |
 | `MIN_SCORE` | Minimum score for an article to make the digest (raise if you get too much fluff, lower if too little) | `10` |
 | `DIGEST_HOUR` | Hour (0–23) when the daily digest is pushed | `8` |
 | `IGNORE_AFTER_H` | Ignore articles older than this many hours | `12` |

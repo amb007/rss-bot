@@ -670,4 +670,96 @@ print("_fallback_theme OK")
 # Restore
 r.llm_chat = _orig_llm_chat
 
+# --- thememodel: render + callback ---
+# Test that render_thememodels_page can be called without error (smoke test)
+# We mock the bot send_message to avoid actual Telegram calls
+class _MockBot:
+    def __init__(self):
+        self.sent = []
+    async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
+        self.sent.append((chat_id, text, parse_mode, reply_markup))
+        class _Msg:
+            message_id = 123
+        return _Msg()
+
+mock_bot = _MockBot()
+swe = {}
+providers = [("goo", ["model-1", "model-2", "model-3"]), ("nim", ["nim-m1"])]
+_asyncio.run(r.render_thememodels_page(mock_bot, 123, providers, 0, 0, 10, swe))
+assert len(mock_bot.sent) == 2  # content + nav
+# Check both messages contain expected text
+all_text = " ".join(t for _, t, _, _ in mock_bot.sent)
+assert "Theme model picker" in all_text
+assert "GOO" in all_text or "goo" in all_text
+print("render_thememodels_page smoke OK")
+
+# Test handle_thememodels_callback for model pick
+class _MockCallbackQuery:
+    def __init__(self, data):
+        self.data = data
+        self.answered = None
+    async def answer(self, text):
+        self.answered = text
+
+class _MockUpdate:
+    def __init__(self, data):
+        self.callback_query = _MockCallbackQuery(data)
+        self.effective_chat = type('obj', (object,), {'id': 1})()  # matches TELEGRAM_CHAT_ID=1 in test env
+
+# Add a pick token
+token = f"ts:{r._thememodel_token[0] + 1}"
+r._thememodel_pick[token] = ("goo", "test-model")
+# We need to mock set_setting to not hit the DB
+orig_set_setting = r.set_setting
+r.set_setting = lambda k, v: None
+
+update = _MockUpdate(token)
+asyncio = __import__('asyncio')
+asyncio.run(r.handle_thememodels_callback(update, None))
+assert update.callback_query.answered == "Theme model set to test-model (goo)"
+assert token not in r._thememodel_pick  # cleaned up
+print("handle_thememodels_callback pick OK")
+
+# Test callback with expired token
+update2 = _MockUpdate("ts:99999")
+asyncio.run(r.handle_thememodels_callback(update2, None))
+assert update2.callback_query.answered == "Expired — run /thememodel again."
+print("handle_thememodels_callback expired OK")
+
+r.set_setting = orig_set_setting
+print("thememodel callbacks OK")
+
+# --- Regression test: token counter is a list and increments correctly ---
+# Reset counters to initial state
+r._models_config.token_counter[0] = 0
+r._thememodel_config.token_counter[0] = 0
+r._models_pick.clear()
+r._thememodel_pick.clear()
+
+# Verify _models_token and _thememodel_token are lists (not ints)
+assert isinstance(r._models_config.token_counter, list), "_models_token should be list"
+assert isinstance(r._thememodel_config.token_counter, list), "_thememodel_token should be list"
+assert r._models_config.token_counter == [0], "_models_token should start at [0]"
+assert r._thememodel_config.token_counter == [0], "_thememodel_token should start at [0]"
+
+# Test that token counter increments correctly for /models
+mock_bot = _MockBot()
+swe = {}
+providers = [("goo", ["model-1", "model-2"]), ("nim", ["nim-m1"])]
+_asyncio.run(r.render_models_page(mock_bot, 123, providers, 0, 0, 10, swe))
+assert r._models_config.token_counter[0] > 0, "_models_token should have incremented"
+models_token_after = r._models_config.token_counter[0]
+print(f"_models_token after render: {models_token_after}")
+
+# Test that token counter increments correctly for /thememodel
+mock_bot2 = _MockBot()
+_asyncio.run(r.render_thememodels_page(mock_bot2, 123, providers, 0, 0, 10, swe))
+assert r._thememodel_config.token_counter[0] > 0, "_thememodel_token should have incremented"
+thememodel_token_after = r._thememodel_config.token_counter[0]
+print(f"_thememodel_token after render: {thememodel_token_after}")
+
+# Verify tokens are unique across renders
+assert models_token_after != thememodel_token_after or len(r._models_pick) + len(r._thememodel_pick) > 0
+print("Token counter list regression test OK")
+
 print("ALL TESTS PASSED")

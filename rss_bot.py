@@ -2087,6 +2087,156 @@ _models_state: dict[str, tuple[list[tuple[str, list[str]]], int, int, int, list[
 _models_pick: dict[str, tuple[str, str]] = {}
 _models_token: int = 0
 
+# /thememodel browsing state (for DIGEST_THEME_MODEL setting)
+_thememodel_state: dict[str, tuple[list[tuple[str, list[str]]], int, int, int, list[int]]] = {}
+_thememodel_pick: dict[str, tuple[str, str]] = {}
+_thememodel_token: int = 0
+
+# Generic model picker configuration
+class ModelPickerConfig:
+    def __init__(self, name: str, pick_prefix: str, nav_prefix: str,
+                 state_dict: dict, pick_dict: dict, token_counter: list,
+                 content_text: str, nav_suffix: str,
+                 on_pick: callable):
+        self.name = name
+        self.pick_prefix = pick_prefix
+        self.nav_prefix = nav_prefix
+        self.state_dict = state_dict
+        self.pick_dict = pick_dict
+        self.token_counter = token_counter
+        self.content_text = content_text
+        self.nav_suffix = nav_suffix
+        self.on_pick = on_pick
+
+# /models config
+_models_state: dict = {}
+_models_pick: dict = {}
+_models_token: list = [0]
+_models_config = ModelPickerConfig(
+    name="models",
+    pick_prefix="ms",
+    nav_prefix="mp",
+    state_dict=_models_state,
+    pick_dict=_models_pick,
+    token_counter=_models_token,
+    content_text="● alive · unknown x dead | ☮ free $ paid ? unknown | SWE score — tap a model to use it",
+    nav_suffix="",
+    on_pick=lambda backend, mid: (set_llm_backend(backend) if backend != current_llm_backend() else None, set_llm_model(mid))
+)
+
+# /thememodel config
+_thememodel_state: dict = {}
+_thememodel_pick: dict = {}
+_thememodel_token: list = [0]
+_thememodel_config = ModelPickerConfig(
+    name="thememodel",
+    pick_prefix="ts",
+    nav_prefix="tp",
+    state_dict=_thememodel_state,
+    pick_dict=_thememodel_pick,
+    token_counter=_thememodel_token,
+    content_text="● alive · unknown x dead | ☮ free $ paid ? unknown | SWE score — tap to set as DIGEST_THEME_MODEL",
+    nav_suffix=" — <i>Theme model picker</i>",
+    on_pick=lambda backend, mid: set_setting("DIGEST_THEME_MODEL", f"{backend}:{mid}")
+)
+
+async def render_model_picker_page(bot, chat_id: int, providers: list[tuple[str, list[str]]],
+                             pidx: int, moff: int, n: int, swe: dict,
+                             config: ModelPickerConfig) -> None:
+    """Generic model picker page renderer."""
+    total_p = len(providers)
+    if pidx < 0:
+        pidx = total_p - 1
+    elif pidx >= total_p:
+        pidx = 0
+    backend, models = providers[pidx]
+    n_models = len(models)
+    total_pages = max(1, (n_models + n - 1) // n)
+    cur_page = (moff // n) + 1
+    page = models[moff:moff + n]
+
+    kb = []
+    for mid in page:
+        config.token_counter[0] += 1
+        tok = f"{config.pick_prefix}:{config.token_counter[0]}"
+        config.pick_dict[tok] = (backend, mid)
+        kb.append([InlineKeyboardButton(_model_button_text(backend, mid, swe),
+                                        callback_data=tok)])
+
+    content = await bot.send_message(chat_id=chat_id,
+                                     text=config.content_text,
+                                     reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+    nav_row = []
+    prev_p = next_p = prev_m = next_m = None
+    if total_p > 1:
+        config.token_counter[0] += 1
+        prev_p = f"{config.nav_prefix}p:{config.token_counter[0]}"
+        nav_row.append(InlineKeyboardButton(
+            f"← {_prov_short(providers[(pidx-1) % total_p][0])}", callback_data=prev_p))
+    if moff > 0:
+        config.token_counter[0] += 1
+        prev_m = f"{config.nav_prefix}l:{config.token_counter[0]}"
+        nav_row.append(InlineKeyboardButton("← Prev", callback_data=prev_m))
+    nav_row.append(InlineKeyboardButton(f"{cur_page}/{total_pages}", callback_data="none"))
+    if moff + n < n_models:
+        config.token_counter[0] += 1
+        next_m = f"{config.nav_prefix}r:{config.token_counter[0]}"
+        nav_row.append(InlineKeyboardButton("Next →", callback_data=next_m))
+    if total_p > 1:
+        config.token_counter[0] += 1
+        next_p = f"{config.nav_prefix}n:{config.token_counter[0]}"
+        nav_row.append(InlineKeyboardButton(
+            f"{_prov_short(providers[(pidx+1) % total_p][0])} →", callback_data=next_p))
+    nav_text = f"<b>{backend.upper()}</b> — {n_models} models (page {cur_page}/{total_pages}){config.nav_suffix}"
+    nav = await bot.send_message(chat_id=chat_id, text=nav_text, parse_mode="HTML",
+                                 reply_markup=InlineKeyboardMarkup([nav_row]))
+    page_msg_ids = [nav.message_id, content.message_id]
+    if prev_p:
+        config.state_dict[prev_p] = (providers, pidx - 1, 0, n, page_msg_ids)
+    if next_p:
+        config.state_dict[next_p] = (providers, pidx + 1, 0, n, page_msg_ids)
+    if prev_m:
+        config.state_dict[prev_m] = (providers, pidx, moff - n, n, page_msg_ids)
+    if next_m:
+        config.state_dict[next_m] = (providers, pidx, moff + n, n, page_msg_ids)
+
+async def handle_model_picker_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                       config: ModelPickerConfig) -> None:
+    """Generic model picker callback handler."""
+    q = update.callback_query
+    if not q or update.effective_chat.id != TELEGRAM_CHAT_ID:
+        if q:
+            await q.answer("Unauthorized")
+        return
+    data = q.data
+    if data.startswith(f"{config.pick_prefix}:"):
+        pick = config.pick_dict.get(data)
+        if not pick:
+            await q.answer(f"Expired — run /{config.name} again.")
+            return
+        backend, mid = pick
+        config.on_pick(backend, mid)
+        logging.info(f"/{config.name} pick → {mid} ({backend})")
+        await q.answer(f"{'Using' if config.name == 'models' else 'Theme model set to'} {mid} ({backend})")
+        config.pick_dict.pop(data, None)
+        return
+    nav_prefixes = (f"{config.nav_prefix}p:", f"{config.nav_prefix}n:",
+                    f"{config.nav_prefix}l:", f"{config.nav_prefix}r:")
+    if not data.startswith(nav_prefixes):
+        return
+    state = config.state_dict.get(data)
+    if not state:
+        await q.answer(f"Model list expired — run /{config.name} again.")
+        return
+    providers, new_pidx, new_moff, n, old_ids = state
+    config.state_dict.pop(data, None)
+    swe = _load_swe_scores() or {}
+    await _delete_msgs(ctx.bot, update.effective_chat.id, old_ids)
+    await render_model_picker_page(ctx.bot, update.effective_chat.id, providers,
+                                    new_pidx, new_moff, n, swe, config)
+    await q.answer()
+
 def _prov_short(backend: str) -> str:
     """3-letter provider shortcut for nav buttons."""
     return {"llamacpp": "LCP", "nim": "NIM", "goo": "GOO", "zen": "ZEN"}.get(
@@ -2117,66 +2267,7 @@ def _model_button_text(backend: str, model_id: str, swe: dict) -> str:
 
 async def render_models_page(bot, chat_id: int, providers: list[tuple[str, list[str]]],
                              pidx: int, moff: int, n: int, swe: dict) -> None:
-    """Send one provider's model page: a content message whose keyboard is the
-    models (tap = /model), plus a nav message with provider + model paging."""
-    global _models_token
-    total_p = len(providers)
-    if pidx < 0:
-        pidx = total_p - 1
-    elif pidx >= total_p:
-        pidx = 0
-    backend, models = providers[pidx]
-    n_models = len(models)
-    total_pages = max(1, (n_models + n - 1) // n)
-    cur_page = (moff // n) + 1
-    page = models[moff:moff + n]
-
-    # content message: one button per model row → select that model
-    kb = []
-    for mid in page:
-        _models_token += 1
-        tok = f"ms:{_models_token}"
-        _models_pick[tok] = (backend, mid)
-        kb.append([InlineKeyboardButton(_model_button_text(backend, mid, swe),
-                                        callback_data=tok)])
-
-    # content: model buttons with legend header
-    content = await bot.send_message(chat_id=chat_id,
-                                     text="● alive · unknown x dead | ☮ free $ paid ? unknown | SWE score — tap a model to use it",
-                                     reply_markup=InlineKeyboardMarkup(kb) if kb else None)
-    nav_row = []
-    prev_p = next_p = prev_m = next_m = None
-    if total_p > 1:
-        _models_token += 1
-        prev_p = f"mp:{_models_token}"
-        nav_row.append(InlineKeyboardButton(
-            f"← {_prov_short(providers[(pidx-1) % total_p][0])}", callback_data=prev_p))
-    if moff > 0:
-        _models_token += 1
-        prev_m = f"ml:{_models_token}"
-        nav_row.append(InlineKeyboardButton("← Prev", callback_data=prev_m))
-    nav_row.append(InlineKeyboardButton(f"{cur_page}/{total_pages}", callback_data="none"))
-    if moff + n < n_models:
-        _models_token += 1
-        next_m = f"mr:{_models_token}"
-        nav_row.append(InlineKeyboardButton("Next →", callback_data=next_m))
-    if total_p > 1:
-        _models_token += 1
-        next_p = f"mn:{_models_token}"
-        nav_row.append(InlineKeyboardButton(
-            f"{_prov_short(providers[(pidx+1) % total_p][0])} →", callback_data=next_p))
-    nav_text = f"<b>{backend.upper()}</b> — {n_models} models (page {cur_page}/{total_pages})"
-    nav = await bot.send_message(chat_id=chat_id, text=nav_text, parse_mode="HTML",
-                                 reply_markup=InlineKeyboardMarkup([nav_row]))
-    page_msg_ids = [nav.message_id, content.message_id]
-    if prev_p:
-        _models_state[prev_p] = (providers, pidx - 1, 0, n, page_msg_ids)
-    if next_p:
-        _models_state[next_p] = (providers, pidx + 1, 0, n, page_msg_ids)
-    if prev_m:
-        _models_state[prev_m] = (providers, pidx, moff - n, n, page_msg_ids)
-    if next_m:
-        _models_state[next_m] = (providers, pidx, moff + n, n, page_msg_ids)
+    await render_model_picker_page(bot, chat_id, providers, pidx, moff, n, swe, _models_config)
 
 async def handle_models_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2251,6 +2342,58 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await render_models_page(ctx.bot, update.effective_chat.id, providers, 0, 0,
                              int(S("MODELS_PER_PAGE")), swe)
+
+async def render_thememodels_page(bot, chat_id: int, providers: list[tuple[str, list[str]]],
+                                  pidx: int, moff: int, n: int, swe: dict) -> None:
+    await render_model_picker_page(bot, chat_id, providers, pidx, moff, n, swe, _thememodel_config)
+
+async def handle_thememodels_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await handle_model_picker_callback(update, ctx, _thememodel_config)
+
+async def cmd_thememodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = " ".join(ctx.args).strip().lower()  # type: ignore[arg-type]
+    force = args == "refresh"
+    if force:
+        await update.message.reply_text("Discovering + probing models… (may take ~1 min)")  # type: ignore[union-attr]
+
+    swe = _load_swe_scores()
+    if not swe:
+        swe = await refresh_swe_scores()
+
+    providers: list[tuple[str, list[str]]] = []
+    for b in known_backends():
+        ids = await discover_models(b)
+        def _sort_key(mid: str, b=b):
+            with db() as c:
+                row = c.execute("SELECT last_status FROM model_health WHERE backend=? AND model_id=?",
+                                (b, mid)).fetchone()
+            status = row["last_status"] if row else None
+            status_cat = 0 if status in ("ok", "rate_limited") else \
+                         (1 if status == "unknown" else 2)
+            free = _looks_free(b, mid) is True
+            return (status_cat, not free, -_swe_score_for(mid, swe), mid.lower())
+        ids_sorted = sorted(ids, key=_sort_key)
+        if force:
+            to_probe = [m for m in ids_sorted if _looks_free(b, m) is not False]
+            sem = asyncio.Semaphore(8)
+            async def probe_one(mid):
+                async with sem:
+                    st = await probe_model(b, mid)
+                    _record_health(b, mid, st)
+            await asyncio.gather(*(probe_one(m) for m in to_probe))
+        providers.append((b, ids_sorted))
+    if not providers:
+        await update.message.reply_text("No configured backends — set <BACKEND>_BASE_URL in .env")  # type: ignore[union-attr]
+        return
+    # Show current theme model
+    import os
+    with db() as c:
+        row = c.execute("SELECT value FROM settings WHERE key='DIGEST_THEME_MODEL'").fetchone()
+    cur_theme = os.environ.get('DIGEST_THEME_MODEL') or (row['value'] if row else '')
+    if cur_theme:
+        await update.message.reply_text(f"Current theme model: {cur_theme}")  # type: ignore[union-attr]
+    await render_thememodels_page(ctx.bot, update.effective_chat.id, providers, 0, 0,
+                                   int(S("MODELS_PER_PAGE")), swe)
 
 async def cmd_automodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = " ".join(ctx.args).strip().lower()  # type: ignore[arg-type]
@@ -2369,6 +2512,7 @@ async def cmd_commands(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/model NAME   — switch LLM model (persists to .env)\n"
         "/backend NAME — switch LLM backend (must be configured in .env)\n"
         "/models       — list discovered models + SWE% + health\n"
+        "/thememodel   — browse models and pick one for digest theme opener\n"
         "/automodel on — auto-switch to a live model when current dies\n"
         "/profile     — show your taste profile\n"
         "/remember    — update profile explicitly\n"
@@ -2744,6 +2888,7 @@ def main():
     app.add_handler(CommandHandler("model",    cmd_model,     filters=owner))
     app.add_handler(CommandHandler("backend",  cmd_backend,   filters=owner))
     app.add_handler(CommandHandler("models",   cmd_models,    filters=owner))
+    app.add_handler(CommandHandler("thememodel", cmd_thememodel, filters=owner))
     app.add_handler(CommandHandler("automodel",cmd_automodel, filters=owner))
     app.add_handler(CommandHandler("addfeed",     cmd_addfeed,    filters=owner))
     app.add_handler(CommandHandler("removefeed",  cmd_removefeed, filters=owner))
@@ -2751,6 +2896,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_search_callback, pattern=r"^(ps|ns):"))
     app.add_handler(CallbackQueryHandler(handle_feed_callback, pattern=r"^(fp|fn):"))
     app.add_handler(CallbackQueryHandler(handle_models_callback, pattern=r"^(ms|mp|mn|ml|mr):"))
+    app.add_handler(CallbackQueryHandler(handle_thememodels_callback, pattern=r"^(ts|tp|tn|tl|tr):"))
     app.add_handler(CallbackQueryHandler(_handle_page_cb, pattern=r"^none$"))
     app.add_handler(MessageReactionHandler(handle_reaction, chat_id=TELEGRAM_CHAT_ID))
     app.add_handler(MessageHandler(filters.ALL & owner, handle_message))

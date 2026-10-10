@@ -122,6 +122,7 @@ app.add_handler(MessageReactionHandler(handle_reaction, chat_id=TELEGRAM_CHAT_ID
 | `DIGEST_TOP_PICKS` | `4` | Number of articles in "🔥 Top picks" (random sample from top 20) |
 | `DIGEST_TEXT_BUDGET` | `5` | How many top-scoring articles the LLM analyzes for the theme opener |
 | `DIGEST_THEME_LINES` | `2` | Lines in the theme opener (`0` to disable, `N>0` for N lines) |
+| `DIGEST_THEME_MODEL` | `""` | Dedicated model for the theme opener (`backend:model_id`); set via `/thememodel` |
 | `MIN_SCORE` | `10` | Minimum LLM score for a "keep" article |
 | `PROFILE_EXAMPLES` | `30` | Number of saved-article examples used to derive the interest profile |
 | `SCORE_BATCH` | `10` | Articles scored per LLM batch |
@@ -235,6 +236,7 @@ point `<BACKEND>_BASE_URL` (e.g. `LLAMACPP_BASE_URL`) at a local
 | `/remember` / `/get` / `/set` | Save / look up / change settings and profile |
 | `/model NAME` | Switch the active backend's LLM model |
 | `/backend NAME` | Switch LLM backend (must have `<NAME>_BASE_URL` in `.env`) |
+| `/thememodel` | Browse models and pick one for the digest theme opener (stores `backend:model_id` in `DIGEST_THEME_MODEL`) |
 | `/stats` | Bot statistics |
 | `/commands` | List commands |
 | `/scoreall` | Force-scoring all unscored articles |
