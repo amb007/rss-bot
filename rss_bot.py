@@ -1407,7 +1407,7 @@ def unseen_snapshot() -> list[dict]:
     with db() as c:
         rows = c.execute("""
             SELECT id, title, source, score, url, hn_points, hn_comments,
-                   confidence, liked_at, disliked_at
+                   confidence, liked_at, disliked_at, published
             FROM articles
             WHERE sent_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL
               AND published < ?
@@ -1437,7 +1437,15 @@ def make_article_msg(r) -> str:
         if cmts:
             parts.append(f"{cmts} comments")
         hn = f" ({', '.join(parts)})" if parts else ""
-    return f"{score_str}{conf} · <a href=\"{r['url']}\">{title}</a> — {source}{hn}"
+    published_str = ""
+    if "published" in r.keys() and r["published"]:
+        try:
+            from dateutil import parser as _parser
+            dt = _parser.parse(r["published"])
+            published_str = f" · {dt.strftime('%Y-%m-%d')}"
+        except Exception:
+            pass
+    return f"{score_str}{conf} · <a href=\"{r['url']}\">{title}</a> — {source}{hn}{published_str}"
 
 async def tg_send(send_fn, *args, retries=3, **kwargs):
     for attempt in range(retries):

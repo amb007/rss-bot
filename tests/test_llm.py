@@ -255,6 +255,11 @@ base = {"score": 42, "confidence": None, "title": "T", "source": "S",
         "liked_at": None, "disliked_at": None}
 assert r.make_article_msg(base).startswith("42")
 assert "<a href=\"http://x\">T</a>" in r.make_article_msg(base)
+
+# Test with published date
+base_with_date = dict(base, published="2024-12-15T10:30:00+00:00")
+msg = r.make_article_msg(base_with_date)
+assert " · 2024-12-15" in msg, f"Expected date in message, got: {msg}"
 print("make_article_msg OK")
 
 # _is_text_model excludes image/tts/embedding/etc from fallback candidates
