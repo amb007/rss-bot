@@ -1302,7 +1302,8 @@ Reply ONLY with a JSON array: [{{"id":"...","score":N,"confidence":"high|medium|
             logging.error(f"Scoring error: {e}\nRaw: {raw}")
             raise
         finally:
-            _scoring_lock.release()
+            if acquired and _scoring_lock.locked():
+                _scoring_lock.release()
 
 def _format_article_for_scoring(r, truncate_words):
     summary = truncate_words(r["summary"], 50) if r["summary"] else ""
