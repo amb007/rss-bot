@@ -842,4 +842,135 @@ print(f"_thememodel_token after render: {thememodel_token_after}")
 assert models_token_after != thememodel_token_after or len(r._models_pick) + len(r._thememodel_pick) > 0
 print("Token counter list regression test OK")
 
+
+# --- score_unscored: lock mechanism tests ---
+class _MockLLMChatScore:
+    def __init__(self, reply):
+        self.reply = reply
+    async def __call__(self, messages, max_tokens=512, retries=None):
+        return self.reply
+
+_orig_llm_chat = r.llm_chat
+_orig_scoring_lock = r._scoring_lock
+
+async def _test_scoring_lock():
+    lock = r._scoring_lock
+    # one unscored article so the scoring loop actually reaches llm_chat
+    import datetime as _dtl
+    with r.db() as c:
+        c.execute("INSERT OR REPLACE INTO articles (id,url,title,source,published,score,sent_at)"
+                  " VALUES (?,?,?,?,?,?,?)",
+                  ("locktest1", "http://x/lock1", "LockTest", "s",
+                   _dtl.datetime.now(_dtl.timezone.utc).isoformat(), None, None))
+
+    # 1) busy path: lock held -> notify called once, scoring skipped
+    await lock.acquire()
+    busy, ran = [], []
+    async def _spy(*a, **k):
+        ran.append(True)
+        return '[{"id":"locktest1","score":50,"confidence":"high"}]'
+    async def _notify():
+        busy.append(True)
+    r.llm_chat = _spy
+    try:
+        await r.score_unscored(notify_busy=_notify)
+        assert len(busy) == 1, f"notify called once, got {len(busy)}"
+        assert not ran, "scoring must not run while lock is held"
+    finally:
+        lock.release()
+
+    # 2) free path: scoring runs, lock released afterwards
+    r.llm_chat = _MockLLMChatScore('[{"id":"locktest1","score":50,"confidence":"high"}]')
+    await r.score_unscored()
+    assert not lock.locked(), "lock must be released after completion"
+
+    # 3) error path: llm_chat raises -> lock still released
+    async def _boom(*a, **k):
+        raise ValueError("boom")
+    r.llm_chat = _boom
+    try:
+        await r.score_unscored()
+    except ValueError:
+        pass
+    assert not lock.locked(), "lock must be released after error"
+
+    # 4) cancellation path (hourly-job timeout): cancel mid-run -> lock released.
+    #    CancelledError is a BaseException -- 'except Exception' must NOT swallow it;
+    #    only the async-with scope may release the lock here.
+    import json as _json
+    async def _slow(*a, **k):
+        await asyncio.sleep(30)
+        return '[]'
+    r.llm_chat = _slow
+    # step 2 already scored locktest1 -- reset it so this run has work to do
+    with r.db() as c:
+        c.execute("UPDATE articles SET score=NULL, confidence=NULL WHERE id='locktest1'")
+    task = asyncio.create_task(r.score_unscored())
+    for _ in range(100):               # wait until the run holds the lock
+        if lock.locked():
+            break
+        await asyncio.sleep(0.01)
+    assert lock.locked(), "lock should be held while scoring runs"
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert not lock.locked(), "lock must be released after cancellation"
+
+    # 5) multi-batch regression: >SCORE_BATCH articles -> loop runs >=2 iterations.
+    #    A per-iteration lock release (the original bug) raises
+    #    "Lock is not acquired" on the second iteration -- this test catches it.
+    batch = int(r.S("SCORE_BATCH"))
+    import datetime as _dtl2
+    with r.db() as c:
+        for i in range(2, batch + 2):  # locktest2..locktest(batch+1)
+            c.execute("INSERT OR REPLACE INTO articles (id,url,title,source,published,score,sent_at)"
+                      " VALUES (?,?,?,?,?,?,?)",
+                      (f"locktest{i}", f"http://x/lock{i}", f"LockTest{i}", "s",
+                       _dtl2.datetime.now(_dtl2.timezone.utc).isoformat(), None, None))
+    calls = []
+    async def _spy_ids(*a, **k):
+        calls.append(1)
+        with r.db() as c:
+            rows = c.execute(
+                "SELECT id FROM articles WHERE score IS NULL AND ignored_at IS NULL"
+                " AND disliked_at IS NULL AND published >= ?",
+                (r.age_cutoff(),)).fetchall()
+        # emulate the real contract: reply only for the batch the caller sent
+        rows = rows[:int(r.S("SCORE_BATCH"))]
+        return _json.dumps([{"id": x["id"], "score": 50, "confidence": "high"} for x in rows])
+    r.llm_chat = _spy_ids
+    await r.score_unscored()
+    assert not lock.locked(), "lock released after multi-batch run"
+    assert len(calls) >= 2, f"expected >=2 scoring batches, got {len(calls)}"
+
+    with r.db() as c:
+        c.execute("DELETE FROM articles WHERE id LIKE 'locktest%'")
+    r.llm_chat = _orig_llm_chat
+    print("score_unscored lock tests OK")
+
+_asyncio.run(_test_scoring_lock())
+
+# --- _format_article_for_scoring with published date ---
+# Test published date formatting
+base = {"score": 42, "confidence": None, "title": "T", "source": "S",
+        "url": "http://x", "hn_points": None, "hn_comments": None,
+        "liked_at": None, "disliked_at": None}
+base_with_date = dict(base, published="2024-12-15T10:30:00+00:00")
+msg = r.make_article_msg(base_with_date)
+assert " · 2024-12-15" in msg, f"Expected date in message, got: {msg}"
+
+# Test with invalid date (should not crash)
+base_bad_date = dict(base, published="not-a-date")
+msg = r.make_article_msg(base_bad_date)
+assert " · " not in msg or msg.count(" · ") == 1, f"Should not have extra separators: {msg}"
+
+# Test without published field
+base_no_date = dict(base)
+msg = r.make_article_msg(base_no_date)
+assert " · " not in msg or msg.count(" · ") == 1, f"Should not have date: {msg}"
+
+print("make_article_msg published date tests OK")
+
 print("ALL TESTS PASSED")

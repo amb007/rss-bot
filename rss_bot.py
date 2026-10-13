@@ -1218,35 +1218,47 @@ async def classify_message(text: str) -> str:
 _scoring_lock = asyncio.Lock()
 
 async def score_unscored(notify_busy=None):
-    cutoff = age_cutoff()
-    while True:
-        with db() as c:
-            rows = c.execute("""
-                SELECT id, title, source, summary, published, hn_points, hn_comments FROM articles
-                WHERE score IS NULL AND ignored_at IS NULL
-                  AND disliked_at IS NULL AND published >= ?
-                ORDER BY fetched_at DESC LIMIT ?
-            """, (cutoff, S("SCORE_BATCH"))).fetchall()
-        if not rows:
-            break
-        profile = get_taste_profile()
-        with db() as c:
-            positives = c.execute("""
-                SELECT title, source, score FROM articles
-                WHERE liked_at IS NOT NULL ORDER BY liked_at DESC LIMIT ?
-            """, (S("PROFILE_EXAMPLES"),)).fetchall()
-            disliked = c.execute("""
-                SELECT title, source, score FROM articles
-                WHERE disliked_at IS NOT NULL
-                ORDER BY disliked_at DESC LIMIT ?
-            """, (S("PROFILE_EXAMPLES"),)).fetchall()
-            auto_ignored_count = c.execute("""
-                SELECT COUNT(*) FROM articles
-                WHERE ignored_at IS NOT NULL AND disliked_at IS NULL
-            """).fetchone()[0]
-        pos_text = "\n".join(f"- [{int(r['score'] or 0)}] {r['title']} ({r['source']})" for r in positives) or "none yet"
-        dis_text = "\n".join(f"- [{int(r['score'] or 0)}] {r['title']} ({r['source']})" for r in disliked) or "none yet"
-        system = f"""You are a personal news relevance scorer.
+    """Score unscored articles. If scoring is already in progress, calls notify_busy
+    and returns immediately instead of queuing. The lock is always released in
+    finally block to prevent deadlock on timeout/error.
+    """
+    # Non-blocking: if a scoring run is already active, notify and bail out
+    if _scoring_lock.locked():
+        if notify_busy:
+            res = notify_busy()
+            if asyncio.iscoroutine(res):
+                await res
+        return
+    async with _scoring_lock:
+        cutoff = age_cutoff()
+        while True:
+            with db() as c:
+                rows = c.execute("""
+                    SELECT id, title, source, summary, published, hn_points, hn_comments FROM articles
+                    WHERE score IS NULL AND ignored_at IS NULL
+                      AND disliked_at IS NULL AND published >= ?
+                    ORDER BY fetched_at DESC LIMIT ?
+                """, (cutoff, S("SCORE_BATCH"))).fetchall()
+            if not rows:
+                break
+            profile = get_taste_profile()
+            with db() as c:
+                positives = c.execute("""
+                    SELECT title, source, score FROM articles
+                    WHERE liked_at IS NOT NULL ORDER BY liked_at DESC LIMIT ?
+                """, (S("PROFILE_EXAMPLES"),)).fetchall()
+                disliked = c.execute("""
+                    SELECT title, source, score FROM articles
+                    WHERE disliked_at IS NOT NULL
+                    ORDER BY disliked_at DESC LIMIT ?
+                """, (S("PROFILE_EXAMPLES"),)).fetchall()
+                auto_ignored_count = c.execute("""
+                    SELECT COUNT(*) FROM articles
+                    WHERE ignored_at IS NOT NULL AND disliked_at IS NULL
+                """).fetchone()[0]
+            pos_text = "\n".join(f"- [{int(r['score'] or 0)}] {r['title']} ({r['source']})" for r in positives) or "none yet"
+            dis_text = "\n".join(f"- [{int(r['score'] or 0)}] {r['title']} ({r['source']})" for r in disliked) or "none yet"
+            system = f"""You are a personal news relevance scorer.
 Taste profile: {profile or 'not established yet'}
 Articles user shared (liked) — higher original score = stronger signal:
 {pos_text}
@@ -1265,45 +1277,42 @@ For each article, score how well it matches the user's taste profile:
 Be critical — high scores should be rare. Use the full range. Defaulting to 50 is discouraged.
 Some articles include hn_points and hn_comments (from Hacker News). Higher points = strong community interest (positive signal). Comments indicate engagement but can mean controversy — use as a mild positive.
 Reply ONLY with a JSON array: [{{"id":"...","score":N,"confidence":"high|medium|low"}}, ...]"""
-        def truncate_words(text, n=50):
-            words = text.split()
-            return " ".join(words[:n]) + ("..." if len(words) > n else "")
-        articles_text = "\n".join(
-            _format_article_for_scoring(r, truncate_words)
-            for r in rows
-        )
-        raw = ""
-        try:
-            raw = await asyncio.wait_for(llm_chat([
-                {"role": "system", "content": system},
-                {"role": "user",   "content": f"Score these articles:\n{articles_text}"}
-            ], max_tokens=8192), timeout=300)
-            raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```")
+            def truncate_words(text, n=50):
+                words = text.split()
+                return " ".join(words[:n]) + ("..." if len(words) > n else "")
+            articles_text = "\n".join(
+                _format_article_for_scoring(r, truncate_words)
+                for r in rows
+            )
+            raw = ""
             try:
-                scores = json.loads(raw)
-                if isinstance(scores, dict):
-                    scores = next((v for v in scores.values() if isinstance(v, list)), [scores])
-            except json.JSONDecodeError:
-                scores = [{"id": m[0], "score": int(m[1])}
-                          for m in re.findall(r'"id"\s*:\s*"([^"]+)"\s*,\s*"score"\s*:\s*(\d+)', raw)]
-                logging.warning(f"Recovered {len(scores)} scores from truncated JSON")
-            with db() as c:
-                for item in scores:
-                    confidence = item.get("confidence") if isinstance(item, dict) else None
-                    c.execute("UPDATE articles SET score=?, confidence=? WHERE id=?",
-                              (item["score"], confidence, item["id"]))
-                    if confidence == "low":
-                        logging.info(f"Low confidence on {item['id']} (score={item['score']})")
-            logging.info(f"Scored {len(scores)} articles")
-        except asyncio.TimeoutError:
-            logging.warning(f"LLM batch timed out after 300s — stopping scoring loop")
-            break
-        except Exception as e:
-            logging.error(f"Scoring error: {e}\nRaw: {raw}")
-            raise
-        finally:
-            if acquired and _scoring_lock.locked():
-                _scoring_lock.release()
+                raw = await asyncio.wait_for(llm_chat([
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": f"Score these articles:\n{articles_text}"}
+                ], max_tokens=8192), timeout=300)
+                raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```")
+                try:
+                    scores = json.loads(raw)
+                    if isinstance(scores, dict):
+                        scores = next((v for v in scores.values() if isinstance(v, list)), [scores])
+                except json.JSONDecodeError:
+                    scores = [{"id": m[0], "score": int(m[1])}
+                              for m in re.findall(r'"id"\s*:\s*"([^"]+)"\s*,\s*"score"\s*:\s*(\d+)', raw)]
+                    logging.warning(f"Recovered {len(scores)} scores from truncated JSON")
+                with db() as c:
+                    for item in scores:
+                        confidence = item.get("confidence") if isinstance(item, dict) else None
+                        c.execute("UPDATE articles SET score=?, confidence=? WHERE id=?",
+                                  (item["score"], confidence, item["id"]))
+                        if confidence == "low":
+                            logging.info(f"Low confidence on {item['id']} (score={item['score']})")
+                    logging.info(f"Scored {len(scores)} articles")
+            except asyncio.TimeoutError:
+                logging.warning(f"LLM batch timed out after 300s -- stopping scoring loop")
+                break
+            except Exception as e:
+                logging.error(f"Scoring error: {e}\nRaw: {raw}")
+                raise
 
 def _format_article_for_scoring(r, truncate_words):
     summary = truncate_words(r["summary"], 50) if r["summary"] else ""
