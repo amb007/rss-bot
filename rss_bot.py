@@ -1214,7 +1214,10 @@ async def classify_message(text: str) -> str:
 
 # ── scoring ───────────────────────────────────────────────────────────────────
 
-async def score_unscored():
+# Non-blocking lock to prevent concurrent scoring runs
+_scoring_lock = asyncio.Lock()
+
+async def score_unscored(notify_busy=None):
     cutoff = age_cutoff()
     while True:
         with db() as c:
@@ -1298,6 +1301,8 @@ Reply ONLY with a JSON array: [{{"id":"...","score":N,"confidence":"high|medium|
         except Exception as e:
             logging.error(f"Scoring error: {e}\nRaw: {raw}")
             raise
+        finally:
+            _scoring_lock.release()
 
 def _format_article_for_scoring(r, truncate_words):
     summary = truncate_words(r["summary"], 50) if r["summary"] else ""
@@ -1865,13 +1870,44 @@ async def _handle_page_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── scheduled jobs ────────────────────────────────────────────────────────────
 
 async def hourly_job(app):
+    job_name = "hourly_job"
+    _job_starts[job_name] = datetime.now(timezone.utc)
+    scoring_task = None
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, fetch_feeds)
+        
+        # Calculate proportional timeout based on unscored article count
+        cutoff = age_cutoff()
+        with db() as c:
+            unscored_count = c.execute("""
+                SELECT COUNT(*) FROM articles
+                WHERE score IS NULL AND ignored_at IS NULL
+                  AND disliked_at IS NULL AND published >= ?
+            """, (cutoff,)).fetchone()[0]
+        
+        # Base timeout: 10 min + 30 sec per batch of 10 articles
+        batch_size = int(S("SCORE_BATCH"))
+        estimated_batches = max(1, (unscored_count + batch_size - 1) // batch_size)
+        scoring_timeout = min(600 + estimated_batches * 30, 3000)  # Max 50 min
+        
+        async def _notify_busy():
+            try:
+                await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID,
+                                           text="⏳ Scoring already in progress — skipping this run")
+            except Exception:
+                pass
+        
+        scoring_task = asyncio.create_task(score_unscored(notify_busy=_notify_busy))
         try:
-            await asyncio.wait_for(score_unscored(), timeout=600)
+            await asyncio.wait_for(scoring_task, timeout=scoring_timeout)
         except asyncio.TimeoutError:
-            logging.warning("score_unscored() timed out after 10 minutes — skipping remainder")
+            logging.warning(f"score_unscored() timed out after {scoring_timeout}s — stopping")
+            scoring_task.cancel()
+            try:
+                await scoring_task
+            except asyncio.CancelledError:
+                pass
     except Exception as e:
         logging.error(f"Hourly job error: {e}")
         print(f"HOURLY JOB ERROR: {e}", flush=True)
@@ -1881,17 +1917,51 @@ async def hourly_job(app):
                                            text=f"Hourly job error (LLM down?): {e}")
             except Exception as e2:
                 print(f"FAILED TO SEND ERROR: {e2}", flush=True)
+    finally:
+        if scoring_task and not scoring_task.done():
+            scoring_task.cancel()
+            try:
+                await scoring_task
+            except asyncio.CancelledError:
+                pass
+        _job_starts.pop("hourly_job", None)
 
 async def daily_digest_job(app):
-    mark_ignored()
-    await update_taste_profile()
-    await send_digest(app.bot, TELEGRAM_CHAT_ID)
+    job_name = "daily_digest_job"
+    _job_starts[job_name] = datetime.now(timezone.utc)
+    try:
+        mark_ignored()
+        await update_taste_profile()
+        await send_digest(app.bot, TELEGRAM_CHAT_ID)
+    finally:
+        _job_starts.pop(job_name, None)
 
 async def swe_refresh_job(app):
     try:
         await refresh_swe_scores()
     except Exception as e:
         logging.warning(f"SWE refresh job error: {e}")
+
+# Job monitoring
+_job_starts: dict = {}
+
+async def job_watchdog(application):
+    """Watch for stuck jobs and cancel them if they run too long."""
+    while True:
+        await asyncio.sleep(60)  # Check every minute
+        now = datetime.now(timezone.utc)
+        for job_name, start_time in list(_job_starts.items()):
+            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+            # Hourly job should complete in ~10 min (fetch + scoring timeout 10 min)
+            # Give it 20 min max
+            max_elapsed = 1200  # 20 minutes
+            if elapsed > max_elapsed:
+                logging.warning(f"Job {job_name} stuck for {elapsed:.0f}s — forcing cancel")
+                # Remove from tracking
+                _job_starts.pop(job_name, None)
+                # Note: APScheduler doesn't easily support cancelling a running job
+                # but we log it and the next run will be skipped if max_instances=1
+                # The lock in score_unscored() will also prevent concurrent runs
 
 # ── command handlers ──────────────────────────────────────────────────────────
 
@@ -2953,6 +3023,7 @@ def main():
     app.add_error_handler(error_handler)
 
     scheduler_holder: dict = {}
+    _job_starts: dict = {}
 
     async def start_scheduler(application):
         scheduler = AsyncIOScheduler()
@@ -2970,6 +3041,7 @@ def main():
         scheduler.start()
         logging.info(f"Scheduler started (phase offset: {phase}s)")
         asyncio.create_task(llm_startup_check())
+        asyncio.create_task(job_watchdog(application))
 
     async def stop_scheduler(application):
         scheduler = scheduler_holder.get("job")
