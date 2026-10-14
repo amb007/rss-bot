@@ -973,4 +973,64 @@ assert " · " not in msg or msg.count(" · ") == 1, f"Should not have date: {msg
 
 print("make_article_msg published date tests OK")
 
+# --- tg_send retry wrapper: transient Telegram blips must not kill a response ---
+_orig_sleep = r.asyncio.sleep
+async def _no_sleep(secs):
+    return None
+r.asyncio.sleep = _no_sleep
+try:
+    # 1) transient failure then success -> retried, returns the result
+    attempts = {"n": 0}
+    async def _flaky_send(*a, **k):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise OSError("httpx.ConnectError: (simulated blip)")
+        class _M:
+            message_id = 42
+        return _M()
+    got = _asyncio.run(r.tg_send(_flaky_send, chat_id=1, text="hi"))
+    assert got.message_id == 42
+    assert attempts["n"] == 3, f"expected 3 attempts, got {attempts['n']}"
+    print("tg_send retries transient failure OK")
+
+    # 2) persistent failure -> re-raises after exhausting retries
+    attempts["n"] = 0
+    async def _dead_send(*a, **k):
+        attempts["n"] += 1
+        raise OSError("down for good")
+    try:
+        _asyncio.run(r.tg_send(_dead_send, chat_id=1, text="hi"))
+        raise AssertionError("expected OSError")
+    except OSError:
+        pass
+    assert attempts["n"] == 3, f"expected 3 attempts, got {attempts['n']}"
+    print("tg_send re-raises after retries exhausted OK")
+
+    # 3) regression (the /models incident): picker render survives a blip on
+    #    the first send_message and still delivers content + nav
+    class _FlakyBot:
+        def __init__(self, fail_first=1):
+            self.fail_first = fail_first
+            self.calls = 0
+            self.sent = []
+        async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
+            self.calls += 1
+            if self.calls <= self.fail_first:
+                raise OSError("httpx.ConnectError: (simulated blip)")
+            self.sent.append(text)
+            class _M:
+                message_id = 77
+            return _M()
+    flaky = _FlakyBot(fail_first=1)
+    providers = [("goo", ["m1", "m2"]), ("nim", ["nim-m1"])]
+    _asyncio.run(r.render_model_picker_page(flaky, 123, providers, 0, 0, 10, {}, r._models_config))
+    assert flaky.calls == 3, f"expected 1 failure + 2 successes, got {flaky.calls}"
+    assert len(flaky.sent) == 2, f"content+nav must both arrive, got {len(flaky.sent)}"
+    assert any("tap a model" in t for t in flaky.sent)
+    print("render_model_picker_page survives transient blip OK")
+finally:
+    r.asyncio.sleep = _orig_sleep
+
+print("tg_send retry tests OK")
+
 print("ALL TESTS PASSED")

@@ -1646,7 +1646,7 @@ async def _digest_theme(pool: list[dict]) -> str:
         
         try:
             reply = await llm_chat([{"role": "user", "content": prompt}],
-                                   max_tokens=200, retries=2)
+                                   max_tokens=400, retries=2)
         finally:
             # Restore original model
             if original_backend and original_model:
@@ -1655,15 +1655,36 @@ async def _digest_theme(pool: list[dict]) -> str:
         
         logging.info(f"digest theme raw reply: {reply!r}")
         
-        # Parse JSON response
+        # Parse JSON response — tolerate fences, CoT preamble, and truncation
         import json
-        try:
-            data = json.loads(reply)
-            lines = data.get("lines", [])
-            if isinstance(lines, list) and len(lines) >= n_lines:
-                return "\n".join(str(l).strip() for l in lines[:n_lines] if str(l).strip())
-        except json.JSONDecodeError:
-            pass
+        candidates = [(reply or "").strip()]
+        if "```" in candidates[0]:                 # strip markdown fences
+            candidates[0] = "".join(l for l in candidates[0].splitlines()
+                                    if not l.strip().startswith("```"))
+        s, e = candidates[0].find("{"), candidates[0].rfind("}")
+        if 0 <= s < e:                             # CoT text around the JSON
+            candidates.append(candidates[0][s:e + 1])
+        for cand in candidates:
+            try:
+                data = json.loads(cand)
+                lines = data.get("lines", []) if isinstance(data, dict) else []
+                if isinstance(lines, list) and lines:
+                    clean = [str(l).strip() for l in lines if str(l).strip()]
+                    if clean:
+                        return "\n".join(clean[:n_lines])
+            except (json.JSONDecodeError, AttributeError):
+                continue
+        # Truncated JSON: salvage the quoted strings that made it out
+        if '"lines"' in (reply or ""):
+            tail = reply.split('"lines"', 1)[1]
+            salvaged = [q.strip() for q in __import__('re').findall(r'"([^\"]+)"', tail)
+                        if len(q.strip()) > 15]
+            if salvaged:
+                return "\n".join(salvaged[:n_lines])
+        # CoT reply with a buried 'Common theme:' sentence
+        m = __import__('re').search(r'common themes?\s*:\s*([^\n]+)', (reply or ""), __import__('re').IGNORECASE)
+        if m and len(m.group(1).strip()) > 20:
+            return m.group(1).strip()
         
         # Fallback: simple heuristic summary from top article titles
         return _fallback_theme(top_by_score, n_lines)
@@ -1777,8 +1798,8 @@ async def _send_cards(bot, chat_id, rows) -> list[int]:
     ids = []
     for r in rows:
         try:
-            sent = await bot.send_message(chat_id=chat_id, text=make_article_msg(r),
-                                          parse_mode="HTML", disable_web_page_preview=True)
+            sent = await tg_send(bot.send_message, chat_id=chat_id, text=make_article_msg(r),
+                                 parse_mode="HTML", disable_web_page_preview=True)
         except Exception as e:
             logging.warning(f"card send failed: {e}")
             continue
@@ -1812,7 +1833,7 @@ async def render_search_page(update, ctx, query: str, offset: int, batch: int) -
     total = search_total(query)
     rows = search_articles(query, batch, offset)
     if not rows:
-        await ctx.bot.send_message(chat_id=chat_id, text="No matches.")
+        await tg_send(ctx.bot.send_message, chat_id=chat_id, text="No matches.")
         return
     card_ids = await _send_cards(ctx.bot, chat_id, rows)
 
@@ -1832,8 +1853,8 @@ async def render_search_page(update, ctx, query: str, offset: int, batch: int) -
     kb = InlineKeyboardMarkup([kb_row]) if len(kb_row) > 1 else None
     header = (f"🔎 {total} match{'es' if total != 1 else ''} for "
               f"<code>{escape_html(query)}</code> — page {cur_page}/{total_pages}")
-    nav = await ctx.bot.send_message(chat_id=chat_id, text=header, reply_markup=kb,
-                                     parse_mode="HTML")
+    nav = await tg_send(ctx.bot.send_message, chat_id=chat_id, text=header, reply_markup=kb,
+                        parse_mode="HTML")
     page_msg_ids = [nav.message_id] + card_ids
     if prev_token:
         _search_state[f"ps:{prev_token}"] = (query, offset - batch, batch, page_msg_ids)
@@ -2042,7 +2063,7 @@ async def render_feed_page(bot, chat_id: int, snapshot: list[dict], offset: int,
     total = len(snapshot)
     page = snapshot[offset:offset + n]
     if not page:
-        await bot.send_message(chat_id=chat_id, text="No more articles.")
+        await tg_send(bot.send_message, chat_id=chat_id, text="No more articles.")
         return
 
     card_ids = await _send_cards(bot, chat_id, page)
@@ -2067,7 +2088,7 @@ async def render_feed_page(bot, chat_id: int, snapshot: list[dict], offset: int,
         kb_row.append(InlineKeyboardButton("Next →", callback_data=f"fn:{next_token}"))
     kb = InlineKeyboardMarkup([kb_row]) if len(kb_row) > 1 else None
     header = f"📰 {title} — {total} articles (page {cur_page}/{total_pages})"
-    nav = await bot.send_message(chat_id=chat_id, text=header, reply_markup=kb)
+    nav = await tg_send(bot.send_message, chat_id=chat_id, text=header, reply_markup=kb)
     page_msg_ids = [nav.message_id] + card_ids
     if prev_token:
         _feed_state[f"fp:{prev_token}"] = (snapshot, n, offset - n, page_msg_ids, title)
@@ -2293,9 +2314,9 @@ async def render_model_picker_page(bot, chat_id: int, providers: list[tuple[str,
         kb.append([InlineKeyboardButton(_model_button_text(backend, mid, swe),
                                         callback_data=tok)])
 
-    content = await bot.send_message(chat_id=chat_id,
-                                     text=config.content_text,
-                                     reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+    content = await tg_send(bot.send_message, chat_id=chat_id,
+                            text=config.content_text,
+                            reply_markup=InlineKeyboardMarkup(kb) if kb else None)
 
     nav_row = []
     prev_p = next_p = prev_m = next_m = None
@@ -2319,8 +2340,8 @@ async def render_model_picker_page(bot, chat_id: int, providers: list[tuple[str,
         nav_row.append(InlineKeyboardButton(
             f"{_prov_short(providers[(pidx+1) % total_p][0])} →", callback_data=next_p))
     nav_text = f"<b>{backend.upper()}</b> — {n_models} models (page {cur_page}/{total_pages}){config.nav_suffix}"
-    nav = await bot.send_message(chat_id=chat_id, text=nav_text, parse_mode="HTML",
-                                 reply_markup=InlineKeyboardMarkup([nav_row]))
+    nav = await tg_send(bot.send_message, chat_id=chat_id, text=nav_text, parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([nav_row]))
     page_msg_ids = [nav.message_id, content.message_id]
     if prev_p:
         config.state_dict[prev_p] = (providers, pidx - 1, 0, n, page_msg_ids)
