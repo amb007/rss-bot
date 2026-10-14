@@ -1113,4 +1113,33 @@ assert any("page 2/3" in m["text"] for m in bot2.msgs), \
 assert upd.callback_query.answered, "callback must be answered"
 print("models Next button end-to-end OK")
 
+# --- model status mark: never-probed = unknown (dot), not dead (x) ---
+def _set_health(backend, model_id, status):
+    with r.db() as c:
+        c.execute("INSERT OR REPLACE INTO model_health (backend, model_id, last_status, last_seen)"
+                  " VALUES (?,?,?,?)",
+                  (backend, model_id, status, "2026-10-14T00:00:00+00:00"))
+
+def _clear_health(backend, model_id):
+    with r.db() as c:
+        c.execute("DELETE FROM model_health WHERE backend=? AND model_id=?",
+                  (backend, model_id))
+
+try:
+    _clear_health("goo", "never-probed-model")
+    _set_health("goo", "ok-model", "ok")
+    _set_health("goo", "rl-model", "rate_limited")
+    _set_health("goo", "unknown-model", "unknown")
+    _set_health("goo", "dead-model", "error")
+
+    assert r._model_status_mark("goo", "never-probed-model") == "·", "never-probed must be unknown"
+    assert r._model_status_mark("goo", "ok-model") == "●"
+    assert r._model_status_mark("goo", "rl-model") == "●"
+    assert r._model_status_mark("goo", "unknown-model") == "·"
+    assert r._model_status_mark("goo", "dead-model") == "x", "probed-and-failed must be x"
+    print("model status mark semantics OK")
+finally:
+    for m in ("never-probed-model", "ok-model", "rl-model", "unknown-model", "dead-model"):
+        _clear_health("goo", m)
+
 print("ALL TESTS PASSED")

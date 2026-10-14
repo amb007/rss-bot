@@ -2398,7 +2398,8 @@ def _model_status_mark(backend: str, model_id: str) -> str:
     with db() as c:
         row = c.execute("SELECT last_status FROM model_health WHERE backend=? AND model_id=?",
                         (backend, model_id)).fetchone()
-    status = row["last_status"] if row else None
+    # no row = never probed -> "·" (unknown); only a recorded failed probe is "x"
+    status = row["last_status"] if row else "unknown"
     if status in ("ok", "rate_limited"):
         return "●"
     if status == "unknown":
