@@ -1033,4 +1033,84 @@ finally:
 
 print("tg_send retry tests OK")
 
+# --- model picker nav buttons: callback_data must match the handler routes ---
+# Regression: generic renderer once built tokens like "mpr:12" (nav_prefix+"r")
+# which matched neither the Telegram route pattern nor the dispatcher — the
+# Next/Prev buttons silently did nothing.
+import re as _re_nav
+
+class _CapturingBot:
+    """Records (text, parse_mode, reply_markup) per send_message call."""
+    def __init__(self):
+        self.msgs = []
+    async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
+        self.msgs.append({"text": text, "parse_mode": parse_mode, "markup": reply_markup})
+        class _M:
+            message_id = 500 + len(self.msgs)
+        return _M()
+    async def delete_message(self, chat_id, message_id):
+        pass
+
+def _iter_callbacks(bot):
+    for m in bot.msgs:
+        kb = m["markup"]
+        if kb is None:
+            continue
+        for row in kb.inline_keyboard:
+            for btn in row:
+                if btn.callback_data and btn.callback_data != "none":
+                    yield btn.callback_data
+
+def _check_routes(bot, pattern):
+    rx = _re_nav.compile(pattern)
+    cbs = list(_iter_callbacks(bot))
+    assert cbs, "no callback buttons rendered"
+    for cb in cbs:
+        assert rx.fullmatch(cb), f"callback {cb!r} not routable by {pattern}"
+    return cbs
+
+providers = [("goo", ["m1", "m2", "m3", "m4", "m5"]), ("nim", ["nim-m1", "nim-m2"])]
+
+# /models: 5 models on a page size of 2 -> provider + page nav all present
+bot_m = _CapturingBot()
+_asyncio.run(r.render_models_page(bot_m, 1, providers, 0, 0, 2, {}))
+cbs_m = _check_routes(bot_m, r"^(ms|mp|mn|ml|mr):\d+$")
+assert any(c.startswith("mr:") for c in cbs_m), "Next button missing"
+assert not any(c.startswith("ml:") for c in cbs_m), "Prev must be absent on page 1"
+assert any(c.startswith("mn:") for c in cbs_m), "provider-next missing"
+assert any(c.startswith("mp:") for c in cbs_m), "provider-prev missing"
+print("models nav callback_data routable OK")
+
+# /thememodel: same scheme with t-prefix
+bot_t = _CapturingBot()
+_asyncio.run(r.render_thememodels_page(bot_t, 1, providers, 0, 0, 2, {}))
+cbs_t = _check_routes(bot_t, r"^(ts|tp|tn|tl|tr):\d+$")
+assert any(c.startswith("tr:") for c in cbs_t), "theme Next button missing"
+print("thememodel nav callback_data routable OK")
+
+# end-to-end: tap Next -> handler deletes old msgs and renders page 2
+next_tok = next(c for c in cbs_m if c.startswith("mr:"))
+state_existed = next_tok in r._models_state
+assert state_existed, "nav token not registered in state"
+bot2 = _CapturingBot()
+
+class _Q:
+    def __init__(self, data):
+        self.data = data
+        self.answered = None
+    async def answer(self, text=None):
+        self.answered = text or "ok"
+class _Upd:
+    def __init__(self, data):
+        self.callback_query = _Q(data)
+        self.effective_chat = type("C", (), {"id": 1})()
+
+upd = _Upd(next_tok)
+_asyncio.run(r.handle_models_callback(upd, type("Ctx", (), {"bot": bot2})()))
+assert len(bot2.msgs) == 2, f"page 2 should re-render content+nav, got {len(bot2.msgs)}"
+assert any("page 2/3" in m["text"] for m in bot2.msgs), \
+       f"expected page 2/3 in nav, got {[m['text'] for m in bot2.msgs]}"
+assert upd.callback_query.answered, "callback must be answered"
+print("models Next button end-to-end OK")
+
 print("ALL TESTS PASSED")
