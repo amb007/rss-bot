@@ -1142,4 +1142,66 @@ finally:
     for m in ("never-probed-model", "ok-model", "rl-model", "unknown-model", "dead-model"):
         _clear_health("goo", m)
 
+# --- scoring v2: structured two-layer profile + calibration + 120-word summaries ---
+import datetime as _dtp
+
+def _ins_art(aid, title, summary, score, liked=None, disliked=None):
+    with r.db() as c:
+        c.execute("INSERT OR REPLACE INTO articles (id,url,title,source,published,score,sent_at,"
+                  "liked_at,disliked_at,summary) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (aid, f"http://x/{aid}", title, "s",
+                   _dtp.datetime.now(_dtp.timezone.utc).isoformat(),
+                   score, None, liked, disliked, summary))
+
+_orig_llm_chat2 = r.llm_chat
+captured = {}
+async def _capture(messages, max_tokens=512, retries=None):
+    captured["messages"] = messages
+    return _capture.reply
+_capture.reply = ""
+r.llm_chat = _capture
+
+_now = _dtp.datetime.now(_dtp.timezone.utc)
+try:
+    # 1) structured two-layer profile
+    _ins_art("prof-old", "Old Standing Interest", "older article summary", 70,
+             liked=(_now - _dtp.timedelta(days=20)).isoformat())
+    _ins_art("prof-new", "Recent Obsession", "brand new interest", 70,
+             liked=(_now - _dtp.timedelta(days=2)).isoformat())
+    _capture.reply = "[CORE INTERESTS]\n- standing stuff\n\n[RECENT FOCUS]\n- recent obsession\n\n[DISLIKES]\n- crypto\n"
+    prof = _asyncio.run(r.update_taste_profile("no sports please"))
+    stored = r.get_taste_profile()
+    assert "[CORE INTERESTS]" in stored and "[RECENT FOCUS]" in stored and "[DISLIKES]" in stored, stored[:80]
+    prompt = captured["messages"][0]["content"]
+    assert "Old Standing Interest" in prompt and "Recent Obsession" in prompt  # both evidence windows fed
+    assert "[CORE INTERESTS]" in prompt and "no sports please" in prompt       # format contract + /remember
+    assert "Liked in the last 7 days" in prompt                                # recent window labeled
+    print("structured two-layer profile OK")
+
+    # 2) calibration block + 3) 120-word summaries in the scoring prompt
+    long_summary = " ".join(f"word{i}" for i in range(1, 81))                  # 80 words
+    _ins_art("calib-liked", "Under-scored Gem", long_summary, 35,
+             liked=(_now - _dtp.timedelta(days=1)).isoformat())
+    _ins_art("calib-dis", "Over-scored Junk", "short summary", 90,
+             disliked=(_now - _dtp.timedelta(days=1)).isoformat())
+    _ins_art("calib-fresh", "Fresh Unscored Article", long_summary, None)
+    _capture.reply = '[{"id":"calib-fresh","score":50,"confidence":"high"}]'
+    _asyncio.run(r.score_unscored())
+    system = captured["messages"][0]["content"]
+    user = captured["messages"][1]["content"]
+    assert "CALIBRATION" in system
+    assert "you scored 35" in system and "LIKED it" in system and "Under-scored Gem" in system
+    assert "you scored 90" in system and "DISLIKED it" in system and "Over-scored Junk" in system
+    assert "under-scored" in system and "over-scored" in system                # direction hints present
+    w75 = long_summary.split()[74]
+    assert w75 in user, "80-word summary was truncated below 75 words (old 50-word cap?)"
+    assert "CORE INTERESTS = long-term" in system                              # profile label for the scorer
+    assert "standing stuff" in system                                          # profile fed verbatim
+    print("calibration + 120-word summaries OK")
+finally:
+    r.llm_chat = _orig_llm_chat2
+    with r.db() as c:
+        c.execute("DELETE FROM articles WHERE id IN "
+                  "('prof-old','prof-new','calib-liked','calib-dis','calib-fresh')")
+
 print("ALL TESTS PASSED")

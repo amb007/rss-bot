@@ -1258,13 +1258,26 @@ async def score_unscored(notify_busy=None):
                 """).fetchone()[0]
             pos_text = "\n".join(f"- [{int(r['score'] or 0)}] {r['title']} ({r['source']})" for r in positives) or "none yet"
             dis_text = "\n".join(f"- [{int(r['score'] or 0)}] {r['title']} ({r['source']})" for r in disliked) or "none yet"
+            with db() as c:
+                cal = c.execute("""
+                    SELECT title, source, score, liked_at, disliked_at FROM articles
+                    WHERE score IS NOT NULL AND (liked_at IS NOT NULL OR disliked_at IS NOT NULL)
+                    ORDER BY COALESCE(liked_at, disliked_at) DESC LIMIT 8
+                """).fetchall()
+            cal_text = "\n".join(
+                f'- "{r["title"][:80]}" ({r["source"]}) — you scored {int(r["score"])}, '
+                f'user {"LIKED it — you under-scored this kind of item" if r["liked_at"] else "DISLIKED it — you over-scored this kind of item"}'
+                for r in cal)
+            cal_block = (f"CALIBRATION — your past scores vs the user's actual verdicts "
+                         f"(learn from your misses):\n{cal_text}\n") if cal_text else ""
             system = f"""You are a personal news relevance scorer.
-Taste profile: {profile or 'not established yet'}
+Taste profile (structured: CORE INTERESTS = long-term, RECENT FOCUS = last ~week, DISLIKES = avoid):
+{profile or 'not established yet'}
 Articles user shared (liked) — higher original score = stronger signal:
 {pos_text}
 Articles user explicitly disliked:
 {dis_text}
-({auto_ignored_count} articles were sent but the user never reacted — weak negative signal)
+{cal_block}({auto_ignored_count} articles were sent but the user never reacted — weak negative signal)
 
 For each article, score how well it matches the user's taste profile:
   90-100 = perfect match, must-read
@@ -1277,7 +1290,7 @@ For each article, score how well it matches the user's taste profile:
 Be critical — high scores should be rare. Use the full range. Defaulting to 50 is discouraged.
 Some articles include hn_points and hn_comments (from Hacker News). Higher points = strong community interest (positive signal). Comments indicate engagement but can mean controversy — use as a mild positive.
 Reply ONLY with a JSON array: [{{"id":"...","score":N,"confidence":"high|medium|low"}}, ...]"""
-            def truncate_words(text, n=50):
+            def truncate_words(text, n=120):
                 words = text.split()
                 return " ".join(words[:n]) + ("..." if len(words) > n else "")
             articles_text = "\n".join(
@@ -1315,7 +1328,7 @@ Reply ONLY with a JSON array: [{{"id":"...","score":N,"confidence":"high|medium|
                 raise
 
 def _format_article_for_scoring(r, truncate_words):
-    summary = truncate_words(r["summary"], 50) if r["summary"] else ""
+    summary = truncate_words(r["summary"], 120) if r["summary"] else ""
     extra = []
     if "hn_points" in r.keys() and (r["hn_points"] or r["hn_comments"]):
         pts = int(r["hn_points"])
@@ -1347,12 +1360,21 @@ def mark_ignored():
 
 # ── taste profile ─────────────────────────────────────────────────────────────
 
+# Rolling window (days) for the RECENT FOCUS layer of the taste profile
+_PROFILE_RECENT_DAYS = 7
+
 async def update_taste_profile(user_instruction: str = ""):
+    recent_since = (datetime.now(timezone.utc) - timedelta(days=_PROFILE_RECENT_DAYS)).isoformat()
     with db() as c:
         pos = c.execute("""
             SELECT title, source, summary FROM articles
             WHERE liked_at IS NOT NULL ORDER BY liked_at DESC LIMIT ?
         """, (S("PROFILE_EXAMPLES"),)).fetchall()
+        recent_pos = c.execute("""
+            SELECT title, source, summary FROM articles
+            WHERE liked_at IS NOT NULL AND liked_at >= ?
+            ORDER BY liked_at DESC LIMIT ?
+        """, (recent_since, S("PROFILE_EXAMPLES"))).fetchall()
         liked_sources = {r["source"] for r in pos}
         disliked = c.execute("""
             SELECT title, source, summary FROM articles
@@ -1363,22 +1385,40 @@ async def update_taste_profile(user_instruction: str = ""):
             SELECT COUNT(*) FROM articles
             WHERE ignored_at IS NOT NULL AND disliked_at IS NULL
         """).fetchone()[0]
-    pos_text = "\n".join(f"- {r['title']} ({r['source']}): {r['summary'][:150]}" for r in pos) or "none yet"
-    dis_text = "\n".join(f"- {r['title']} ({r['source']}): {r['summary'][:150]}" for r in disliked) or "none yet"
+    pos_text = "\n".join(f"- {r['title']} ({r['source']}): {r['summary'][:240]}" for r in pos) or "none yet"
+    recent_text = "\n".join(f"- {r['title']} ({r['source']}): {r['summary'][:240]}" for r in recent_pos) or "none yet"
+    dis_text = "\n".join(f"- {r['title']} ({r['source']}): {r['summary'][:240]}" for r in disliked) or "none yet"
     current  = get_taste_profile()
     instruction_block = f"\nNew explicit instruction from user: {user_instruction}" if user_instruction else ""
-    prompt = f"""Rewrite this user's news taste profile as a single coherent paragraph (~150 words).
-Consolidate everything — resolve contradictions, fold in new instructions, reflect implicit signals from liked/disliked/ignored articles.
+    prompt = f"""Update this user's news taste profile. Output EXACTLY three sections, in this format:
 
-Current profile: {current or 'none'}
+[CORE INTERESTS]
+- standing, long-term interests and preferences (topics, sources, formats, tone)
+
+[RECENT FOCUS]
+- what the user has been into in the last {_PROFILE_RECENT_DAYS} days (omit section if no recent evidence)
+
+[DISLIKES]
+- topics / sources / formats the user is NOT interested in
+
+Rules:
+- CORE INTERESTS: conservative merge — keep the existing core unless clearly stale; new standing interests are added; a burst of one-off recent articles must not erase old ones.
+- RECENT FOCUS: rebuilt from the recent-likes evidence below only.
+- DISLIKES: explicit user instructions plus patterns from disliked articles.
+- Bullets only, no prose paragraphs, no headers besides the three bracketed ones, no preamble or closing remarks.
+
+Current profile (may be in an older free-form format — restructure it):
+{current or 'none'}
 {instruction_block}
-Liked articles: {pos_text}
-Explicitly disliked articles: {dis_text}
-({auto_ignored_count} articles were sent but the user never reacted — weak negative signal)
-
-Reply with ONLY the new profile text, no preamble, no headers."""
+All-time liked articles (evidence for CORE INTERESTS):
+{pos_text}
+Liked in the last {_PROFILE_RECENT_DAYS} days (evidence for RECENT FOCUS):
+{recent_text}
+Explicitly disliked articles (evidence for DISLIKES):
+{dis_text}
+({auto_ignored_count} articles were sent but the user never reacted — weak negative signal; do not create a section for it)"""
     try:
-        profile = await llm_chat([{"role": "user", "content": prompt}], max_tokens=1024)
+        profile = await llm_chat([{"role": "user", "content": prompt}], max_tokens=1500)
         print("RAW LLM profile:", repr(profile[:100]), flush=True)
         if not profile.strip():
             profile = user_instruction
