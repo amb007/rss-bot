@@ -94,6 +94,7 @@ SETTING_DEFAULTS = {
     "MODELS_PER_PAGE":      "10",
     "LLM_MIN_INTERVAL":     "3",
     "LLM_MAX_RETRIES":      "4",
+    "LLM_HTTP_TIMEOUT":     "90",  # per-attempt HTTP timeout (s); fast-fail so retries+fallback fit the batch window
     "AUTOMODEL_ENABLED":    "1",
     "SWE_REFRESH_DAYS":     "7",
     "MODEL_PROBE_REFRESH_HOURS": "6",   # "ok" probe older than this is stale
@@ -761,7 +762,8 @@ async def _llm_request(messages: list[dict], max_tokens: int) -> str:
         # NIM-specific params: disable thinking tokens
         payload["chat_template_kwargs"] = {"enable_thinking": False}
         payload["thinking"] = False
-    async with httpx.AsyncClient(timeout=120) as client:
+    _tmo = int(S("LLM_HTTP_TIMEOUT"))
+    async with httpx.AsyncClient(timeout=httpx.Timeout(_tmo, connect=10.0)) as client:
         r = await client.post(f"{llm_base_url()}/chat/completions", headers=headers, json=payload)
         r.raise_for_status()
         msg = r.json()["choices"][0]["message"]
@@ -814,6 +816,29 @@ async def _fallback_and_switch(status: int | None, prefer_other_provider: bool =
         " Use /model to override.")
     return True
 
+async def _request_after_fallback(messages: list[dict], max_tokens, hops=2):
+    """Run one request after a fallback switch. If the freshly-switched model
+    also fails (e.g. transient 503), retry it once, then hop to the next
+    fallback candidate — up to `hops` switches — before re-raising. Bounded so
+    the caller's batch wait_for stays the ultimate deadline."""
+    last_exc: Exception = RuntimeError("no attempt made")
+    for hop in range(hops):
+        for attempt in range(2):
+            try:
+                await _llm_throttle()
+                return await _llm_request(messages, max_tokens)
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+            except Exception as e:
+                last_exc = e
+            if attempt == 0:
+                await asyncio.sleep(2)   # give the just-switched model a second chance
+        if hop < hops - 1:
+            status = last_exc.response.status_code if isinstance(last_exc, httpx.HTTPStatusError) else None
+            if not await _fallback_and_switch(status):
+                break
+    raise last_exc
+
 async def llm_chat(messages: list[dict], max_tokens=512, retries=None) -> str:
     if retries is None:
         retries = int(S("LLM_MAX_RETRIES"))
@@ -830,8 +855,7 @@ async def llm_chat(messages: list[dict], max_tokens=512, retries=None) -> str:
             # dead model → no point retrying, go straight to fallback
             if status in _DEAD_STATUSES:
                 if await _fallback_and_switch(status):
-                    await _llm_throttle()
-                    return await _llm_request(messages, max_tokens)
+                    return await _request_after_fallback(messages, max_tokens)
                 raise
             if attempt >= retries - 1:
                 # a sticky 429 means the model is rate-limited *persistently* —
@@ -843,11 +867,9 @@ async def llm_chat(messages: list[dict], max_tokens=512, retries=None) -> str:
                         _consec_429_storms = 0
                         # provider-wide rate limit → jump to a different backend
                         if await _fallback_and_switch(None, prefer_other_provider=True):
-                            await _llm_throttle()
-                            return await _llm_request(messages, max_tokens)
+                            return await _request_after_fallback(messages, max_tokens)
                 elif await _fallback_and_switch(status):
-                    await _llm_throttle()
-                    return await _llm_request(messages, max_tokens)
+                    return await _request_after_fallback(messages, max_tokens)
                 raise
             wait = _retry_wait(attempt, e.response)
             logging.warning(f"LLM call failed ({status}), retrying in {wait}s...")
@@ -855,11 +877,10 @@ async def llm_chat(messages: list[dict], max_tokens=512, retries=None) -> str:
         except Exception as e:
             if attempt >= retries - 1:
                 if await _fallback_and_switch(None):
-                    await _llm_throttle()
-                    return await _llm_request(messages, max_tokens)
+                    return await _request_after_fallback(messages, max_tokens)
                 raise
             wait = _retry_wait(attempt)
-            logging.warning(f"LLM call failed ({e}), retrying in {wait}s...")
+            logging.warning(f"LLM call failed ({type(e).__name__}: {e or 'no message'}), retrying in {wait}s...")
             await asyncio.sleep(wait)
     return ""  # type: ignore[return]
 
@@ -1217,18 +1238,30 @@ async def classify_message(text: str) -> str:
 # Non-blocking lock to prevent concurrent scoring runs
 _scoring_lock = asyncio.Lock()
 
+# Consecutive LLM batch timeouts; hourly_job notifies the owner every 3rd stall
+_consec_batch_timeouts = 0
+
+def _note_batch_timeout():
+    global _consec_batch_timeouts
+    _consec_batch_timeouts += 1
+
+def _note_batch_scored():
+    global _consec_batch_timeouts
+    _consec_batch_timeouts = 0
+
 async def score_unscored(notify_busy=None):
     """Score unscored articles. If scoring is already in progress, calls notify_busy
     and returns immediately instead of queuing. The lock is always released in
     finally block to prevent deadlock on timeout/error.
-    """
+    Returns -1 when skipped (lock busy), else the number of articles scored."""
+    scored_total = 0
     # Non-blocking: if a scoring run is already active, notify and bail out
     if _scoring_lock.locked():
         if notify_busy:
             res = notify_busy()
             if asyncio.iscoroutine(res):
                 await res
-        return
+        return -1
     async with _scoring_lock:
         cutoff = age_cutoff()
         while True:
@@ -1302,7 +1335,7 @@ Reply ONLY with a JSON array: [{{"id":"...","score":N,"confidence":"high|medium|
                 raw = await asyncio.wait_for(llm_chat([
                     {"role": "system", "content": system},
                     {"role": "user",   "content": f"Score these articles:\n{articles_text}"}
-                ], max_tokens=8192), timeout=300)
+                ], max_tokens=8192, retries=3), timeout=300)
                 raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```")
                 try:
                     scores = json.loads(raw)
@@ -1320,12 +1353,17 @@ Reply ONLY with a JSON array: [{{"id":"...","score":N,"confidence":"high|medium|
                         if confidence == "low":
                             logging.info(f"Low confidence on {item['id']} (score={item['score']})")
                     logging.info(f"Scored {len(scores)} articles")
+                    if scores:
+                        _note_batch_scored()
+                        scored_total += len(scores)
             except asyncio.TimeoutError:
                 logging.warning(f"LLM batch timed out after 300s -- stopping scoring loop")
+                _note_batch_timeout()
                 break
             except Exception as e:
                 logging.error(f"Scoring error: {e}\nRaw: {raw}")
                 raise
+    return scored_total
 
 def _format_article_for_scoring(r, truncate_words):
     summary = truncate_words(r["summary"], 120) if r["summary"] else ""
@@ -1962,14 +2000,7 @@ async def hourly_job(app):
         estimated_batches = max(1, (unscored_count + batch_size - 1) // batch_size)
         scoring_timeout = min(600 + estimated_batches * 30, 3000)  # Max 50 min
         
-        async def _notify_busy():
-            try:
-                await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-                                           text="⏳ Scoring already in progress — skipping this run")
-            except Exception:
-                pass
-        
-        scoring_task = asyncio.create_task(score_unscored(notify_busy=_notify_busy))
+        scoring_task = asyncio.create_task(score_unscored())
         try:
             await asyncio.wait_for(scoring_task, timeout=scoring_timeout)
         except asyncio.TimeoutError:
@@ -1978,6 +2009,15 @@ async def hourly_job(app):
             try:
                 await scoring_task
             except asyncio.CancelledError:
+                pass
+        stall = _consec_batch_timeouts
+        if stall and stall % 3 == 0:
+            try:
+                await app.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=f"⚠️ Scoring stalled: {stall} consecutive batch timeouts — "
+                         f"the LLM may be hanging. Run /models and switch to a live model.")
+            except Exception:
                 pass
     except Exception as e:
         logging.error(f"Hourly job error: {e}")
@@ -2051,8 +2091,14 @@ async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if snapshot and unscored:
         # show now, score in background for next time
         async def _score():
+            async def _busy():
+                try:
+                    await ctx.bot.send_message(chat_id=update.effective_chat.id,  # type: ignore[union-attr]
+                                               text="⏳ Scoring is already running — your feed will refresh as new batches complete.")
+                except Exception:
+                    pass
             try:
-                await score_unscored()
+                await score_unscored(notify_busy=_busy)
             except Exception as e:
                 if "429" not in str(e) and "404" not in str(e):
                     await ctx.bot.send_message(chat_id=update.effective_chat.id,  # type: ignore[union-attr]
@@ -2675,15 +2721,15 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Too old breakdown ({too_old}):\n"
         f"  ✓ Liked: {t_liked}\n"
         f"  ✗ Explicitly disliked: {t_disliked}\n"
-        f"  ➖ Auto-ignored (no reaction): {t_ignored}\n"
-        f"  Seen (sent, no vote): {t_sent}\n"
+        f"  ➖ Ignored (no reaction): {t_ignored}\n"
+        f"  Seen (sent, no reaction yet): {t_sent}\n"
         f"  Unseen — see /unseen: {t_ready}\n"
         f"\n"
         f"Recent breakdown ({recent}):\n"
         f"  ✓ Liked: {r_liked}\n"
         f"  ✗ Explicitly disliked: {r_disliked}\n"
-        f"  ➖ Auto-ignored (no reaction): {r_ignored}\n"
-        f"  Seen (sent, no vote): {r_sent}\n"
+        f"  ➖ Ignored (no reaction): {r_ignored}\n"
+        f"  Seen (sent, no reaction yet): {r_sent}\n"
         f"  Ready for /feed: {r_ready}\n"
         f"  Below MIN_SCORE ({S('MIN_SCORE')}): {r_low}\n"
         f"  Unscored: {r_unscored}\n"
@@ -2747,7 +2793,13 @@ async def cmd_scoreall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 """, (cutoff,)).fetchone()[0]
             if not remaining:
                 break
-            await score_unscored()
+            got = await score_unscored()
+            if got == -1:
+                await ctx.bot.send_message(chat_id=TELEGRAM_CHAT_ID,
+                                           text="⏳ Another scoring run is already in progress — /scoreall paused. Try again in a few minutes.")
+                return
+            if got == 0:
+                break   # batch produced nothing (LLM trouble) — avoid spinning
             batches += 1
         await ctx.bot.send_message(chat_id=TELEGRAM_CHAT_ID,
                                    text=f"Done scoring. {batches} batches processed.")

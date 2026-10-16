@@ -1204,4 +1204,159 @@ finally:
         c.execute("DELETE FROM articles WHERE id IN "
                   "('prof-old','prof-new','calib-liked','calib-dis','calib-fresh')")
 
+# --- scoring stall hardening: configurable timeout, stall counter, owner notify ---
+import inspect as _insp
+assert "LLM_HTTP_TIMEOUT" in r.SETTING_DEFAULTS
+assert int(r.SETTING_DEFAULTS["LLM_HTTP_TIMEOUT"]) == 90
+assert "LLM_HTTP_TIMEOUT" in _insp.getsource(r._llm_request), \
+    "_llm_request must use the configurable HTTP timeout"
+assert "retries=3" in _insp.getsource(r.score_unscored), \
+    "scoring must cap retries so llm_chat's final-attempt fallback fits the batch window"
+print("LLM_HTTP_TIMEOUT + retry budget wired OK")
+
+_orig_fetch = r.fetch_feeds
+_orig_score_fn = r.score_unscored
+_sent_stall = []
+async def _noop_score(notify_busy=None):
+    return 0
+class _StallBot:
+    async def send_message(self, chat_id, text, **k):
+        _sent_stall.append(text)
+        class _M:
+            message_id = 9
+        return _M()
+class _StallApp:
+    bot = _StallBot()
+try:
+    r.fetch_feeds = lambda: None
+    r.score_unscored = _noop_score
+
+    # counter helpers
+    r._note_batch_timeout(); r._note_batch_timeout(); r._note_batch_timeout()
+    assert r._consec_batch_timeouts == 3
+    r._note_batch_scored()
+    assert r._consec_batch_timeouts == 0
+
+    # stall of exactly 3 -> owner notified
+    r._consec_batch_timeouts = 3
+    _asyncio.run(r.hourly_job(_StallApp()))
+    assert any("Scoring stalled" in t for t in _sent_stall), _sent_stall
+
+    # healthy streak (0) -> silent
+    _sent_stall.clear()
+    r._consec_batch_timeouts = 0
+    _asyncio.run(r.hourly_job(_StallApp()))
+    assert not _sent_stall, "no notification expected on a healthy run"
+    print("hourly stall notification OK")
+finally:
+    r.fetch_feeds = _orig_fetch
+    r.score_unscored = _orig_score_fn
+    r._consec_batch_timeouts = 0
+
+# --- post-fallback resilience: a 503 on the freshly-switched model must not
+# --- kill the run; retry once, then hop to the next candidate (bounded)
+import httpx as _hx
+
+def _err503():
+    req = _hx.Request("POST", "http://x/v1/chat/completions")
+    return _hx.HTTPStatusError("503", request=req, response=_hx.Response(503, request=req))
+
+_orig_llm_request = r._llm_request
+_orig_fb_switch = r._fallback_and_switch
+_orig_throttle = r._llm_throttle
+try:
+    async def _no_throttle():
+        return None
+    r._llm_throttle = _no_throttle
+
+    # 1) switch, 503, retry same model, 503 again, hop -> next candidate -> success
+    seq = {"req": 0, "switch": 0}
+    async def _flaky_request(messages, max_tokens=512):
+        seq["req"] += 1
+        if seq["req"] <= 2:
+            raise _err503()
+        return "recovered reply"
+    async def _switch(status):
+        seq["switch"] += 1
+        return True
+    r._llm_request = _flaky_request
+    r._fallback_and_switch = _switch
+    got = _asyncio.run(r._request_after_fallback([{"role": "user", "content": "x"}], 512))
+    assert got == "recovered reply"
+    assert seq["req"] == 3, f"expected 3 attempts (2 on stale + 1 after hop), got {seq['req']}"
+    assert seq["switch"] == 1, f"expected exactly one extra hop, got {seq['switch']}"
+    print("post-fallback 503 -> retry + hop OK")
+
+    # 2) nothing works: second hop finds no candidate -> last 503 re-raised
+    seq2 = {"req": 0, "switch": 0}
+    async def _dead_request(messages, max_tokens=512):
+        seq2["req"] += 1
+        raise _err503()
+    async def _switch_once(status):
+        seq2["switch"] += 1
+        return seq2["switch"] == 1   # first hop ok, then no candidates left
+    r._llm_request = _dead_request
+    r._fallback_and_switch = _switch_once
+    try:
+        _asyncio.run(r._request_after_fallback([{"role": "user", "content": "x"}], 512))
+        raise AssertionError("expected the 503 to propagate")
+    except _hx.HTTPStatusError:
+        pass
+    assert seq2["switch"] == 1, "must stop hopping when no candidates remain"
+    print("post-fallback exhaustion propagates OK")
+finally:
+    r._llm_request = _orig_llm_request
+    r._fallback_and_switch = _orig_fb_switch
+    r._llm_throttle = _orig_throttle
+
+# --- scoring return contract + interactive-only busy notify ---
+import inspect as _insp2
+_src_h = _insp2.getsource(r.hourly_job)
+assert "notify_busy" not in _src_h, "cron scoring must defer silently"
+assert "score_unscored()" in _src_h
+assert "notify_busy" in _insp2.getsource(r.cmd_feed), "/feed should inform when busy"
+assert "already in progress" in _insp2.getsource(r.cmd_scoreall), "/scoreall should inform when busy"
+assert "scored_total" in _insp2.getsource(r.score_unscored)
+print("notify scope (cron silent, interactive informed) OK")
+
+import datetime as _dtr
+
+# busy run -> -1 (and notify still fires)
+async def _t_busy_return():
+    lock = r._scoring_lock
+    await lock.acquire()
+    busy = []
+    async def _notify():
+        busy.append(True)
+    try:
+        got = await r.score_unscored(notify_busy=_notify)
+        assert got == -1, f"busy run must return -1, got {got!r}"
+        assert len(busy) == 1
+    finally:
+        lock.release()
+_asyncio.run(_t_busy_return())
+print("score_unscored busy -> -1 OK")
+
+# free run -> number of articles scored
+async def _t_free_return():
+    with r.db() as c:
+        c.execute("DELETE FROM articles WHERE score IS NULL")   # deterministic batch
+        c.execute("INSERT OR REPLACE INTO articles (id,url,title,source,published,score,sent_at)"
+                  " VALUES (?,?,?,?,?,?,?)",
+                  ("ret1", "http://x/ret1", "RetTest", "s",
+                   _dtr.datetime.now(_dtr.timezone.utc).isoformat(), None, None))
+    orig = r.llm_chat
+    async def _ok(messages, max_tokens=512, retries=None):
+        return '[{"id":"ret1","score":50,"confidence":"high"}]'
+    r.llm_chat = _ok
+    try:
+        got = await r.score_unscored()
+        assert got == 1, f"expected 1 scored, got {got!r}"
+    finally:
+        r.llm_chat = orig
+        with r.db() as c:
+            c.execute("DELETE FROM articles WHERE id='ret1'")
+_asyncio.run(_t_free_return())
+print("score_unscored free -> count OK")
+
 print("ALL TESTS PASSED")
