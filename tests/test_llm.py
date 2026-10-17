@@ -1359,4 +1359,133 @@ async def _t_free_return():
 _asyncio.run(_t_free_return())
 print("score_unscored free -> count OK")
 
+# --- /feed insist: double /feed surfaces the below-threshold pool once ---
+import datetime as _dtd
+
+def _insf(aid, score, sent=None, disliked=None):
+    with r.db() as c:
+        c.execute("INSERT OR REPLACE INTO articles (id,url,title,source,published,score,sent_at,"
+                  "ignored_at,disliked_at,summary) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (aid, f"http://x/{aid}", f"t{aid}", "s",
+                   _dtd.datetime.now(_dtd.timezone.utc).isoformat(),
+                   score, sent, None, disliked, "summary"))
+
+_orig_rfp = r.render_feed_page
+rfp_calls = []
+async def _rec_rfp(bot, chat_id, snapshot, offset, n, title="Your feed"):
+    rfp_calls.append({"ids": [x["id"] for x in snapshot], "title": title})
+
+class _M3:
+    def __init__(self):
+        self.texts = []
+    async def reply_text(self, text, **k):
+        self.texts.append(text)
+class _U3:
+    def __init__(self, uid):
+        self.update_id = uid
+        self.message = _M3()
+        self.effective_chat = type("C", (), {"id": 1})()
+class _Cx3:
+    args = []
+    bot = None
+
+def _tap(u):   # emulate the group -1 TypeHandler
+    _asyncio.run(r._note_update(u, None))
+
+_old_ms = r.get_setting("MIN_SCORE")
+try:
+    r.set_setting("MIN_SCORE", 10)
+    r.render_feed_page = _rec_rfp
+    with r.db() as c:
+        c.execute("DELETE FROM articles")
+    _insf("fb1", 7); _insf("fb8", 6)                    # below threshold, keep
+    _insf("fb2", 0)                                     # explicit dislike -> excluded
+    _insf("fb4", 12)                                    # above threshold -> excluded
+    _insf("fb5", 5, disliked="2026-01-01T00:00:00")     # disliked -> excluded
+    _insf("fb3", 7, sent="2026-01-01T00:00:00")         # already seen -> excluded
+
+    # unit: snapshot picks best-of-sub-threshold only
+    snap = r.below_threshold_snapshot()
+    assert [x["id"] for x in snap] == ["fb1", "fb8"], [x["id"] for x in snap]
+    print("below_threshold_snapshot OK")
+
+    # chain test needs a purely below-threshold world
+    with r.db() as c:
+        c.execute("DELETE FROM articles WHERE id='fb4'")
+
+    upd = _U3(1)
+    r._feed_insist_armed.discard(1)
+    r._empty_feed_upid.pop(1, None)
+
+    # 1st /feed: empty -> plain message, armed
+    upd = _U3(101); _tap(upd)
+    _asyncio.run(r.cmd_feed(upd, _Cx3()))
+    assert any("Nothing new above your threshold." in t for t in upd.message.texts)
+    assert r._empty_feed_upid[1] == 101
+
+    # 2nd /feed immediately: insist view, disarmed
+    upd = _U3(102); _tap(upd)
+    _asyncio.run(r.cmd_feed(upd, _Cx3()))
+    assert any("You insisted" in t for t in upd.message.texts), upd.message.texts
+    assert rfp_calls[-1]["title"] == "Below MIN_SCORE (you insisted)"
+    assert rfp_calls[-1]["ids"] == ["fb1", "fb8"]
+    assert 1 not in r._feed_insist_armed
+
+    # consume the insisted view (real render marks sent)
+    with r.db() as c:
+        c.execute("UPDATE articles SET sent_at=? WHERE id IN ('fb1','fb8')",
+                  (_dtd.datetime.now(_dtd.timezone.utc).isoformat(),))
+
+    # 3rd /feed immediately: evaluated fresh -> still no-new -> plain, re-armed
+    upd = _U3(103); _tap(upd)
+    _asyncio.run(r.cmd_feed(upd, _Cx3()))
+    assert any("Nothing new above your threshold." in t for t in upd.message.texts)
+    assert r._empty_feed_upid[1] == 103
+
+    # 4th /feed immediately: insists again -> pool empty -> "Nothing at all"
+    upd = _U3(104); _tap(upd)
+    _asyncio.run(r.cmd_feed(upd, _Cx3()))
+    assert any("No more scored articles at all" in t for t in upd.message.texts), upd.message.texts
+    assert 1 not in r._feed_insist_armed
+
+    # 5th /feed immediately: fresh again -> plain, re-armed
+    upd = _U3(105); _tap(upd)
+    _asyncio.run(r.cmd_feed(upd, _Cx3()))
+    assert any("Nothing new above your threshold." in t for t in upd.message.texts)
+
+    # chain broken by another update in between -> no insist
+    _other = _U3(106); _tap(_other)          # e.g. /stats (no cmd_feed side effects)
+    upd = _U3(107); _tap(upd)
+    _asyncio.run(r.cmd_feed(upd, _Cx3()))
+    assert any("Nothing new above your threshold." in t for t in upd.message.texts)
+    assert not any("You insisted" in t for t in upd.message.texts)
+    assert r._empty_feed_upid[1] == 107
+
+    # new above-threshold arrival -> normal feed, chain cleared
+    _insf("fb9", 50)
+    upd = _U3(108); _tap(upd)
+    _asyncio.run(r.cmd_feed(upd, _Cx3()))
+    assert rfp_calls[-1]["title"] == "Your feed"
+    assert rfp_calls[-1]["ids"] == ["fb9"]
+    assert 1 not in r._feed_insist_armed and 1 not in r._empty_feed_upid
+    print("/feed insist (simple one-shot) OK")
+
+    # MIN_SCORE <= 0: never arms, never insists
+    r.set_setting("MIN_SCORE", 0)
+    r._feed_insist_armed.discard(1)
+    with r.db() as c:
+        c.execute("DELETE FROM articles")    # empty world at MIN_SCORE=0
+    upd = _U3(201); _tap(upd)
+    _asyncio.run(r.cmd_feed(upd, _Cx3()))
+    assert any("Nothing new above your threshold." in t for t in upd.message.texts)
+    assert 1 not in r._feed_insist_armed
+    upd = _U3(202); _tap(upd)
+    _asyncio.run(r.cmd_feed(upd, _Cx3()))
+    assert any("Nothing new above your threshold." in t for t in upd.message.texts)
+    assert not any("You insisted" in t for t in upd.message.texts)
+    print("/feed insist disabled at MIN_SCORE=0 OK")
+finally:
+    r.render_feed_page = _orig_rfp
+    r.set_setting("MIN_SCORE", _old_ms)
+
 print("ALL TESTS PASSED")

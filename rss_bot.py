@@ -17,7 +17,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    MessageReactionHandler, ContextTypes, filters, CallbackQueryHandler
+    MessageReactionHandler, ContextTypes, filters, CallbackQueryHandler,
+    TypeHandler
 )
 from telegram.request import HTTPXRequest
 import sqlite3
@@ -1489,6 +1490,25 @@ def digest_snapshot() -> list[dict]:
         """, (S("MIN_SCORE"), cutoff)).fetchall()
     return [dict(r) for r in rows]
 
+def below_threshold_snapshot() -> list[dict]:
+    """Scored-but-below-MIN_SCORE articles, still unread and recent — the
+    "you insisted" fallback for a second consecutive empty /feed. Best of the
+    sub-threshold first (score DESC). Excludes score 0 (explicit dislikes) and
+    unscored articles (those arrive normally once judged)."""
+    mark_ignored()
+    cutoff = age_cutoff()
+    with db() as c:
+        rows = c.execute("""
+            SELECT id, title, source, score, url, hn_points, hn_comments,
+                   confidence, liked_at, disliked_at
+            FROM articles
+            WHERE score IS NOT NULL AND score < ? AND score > 0
+              AND sent_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL
+              AND published >= ?
+            ORDER BY score DESC, published ASC
+        """, (S("MIN_SCORE"), cutoff)).fetchall()
+    return [dict(r) for r in rows]
+
 def unseen_snapshot() -> list[dict]:
     """Old, never-seen articles (sent_at IS NULL, not ignored/disliked) that
     are now too old to show in /feed (published before the age window). Ordered
@@ -1821,6 +1841,28 @@ async def send_digest(bot, chat_id: int) -> int:
 _search_state: dict[str, tuple[str, int, int, list[int]]] = {}
 _search_token: int = 0
 
+# /feed insist semantics: an empty /feed arms the chat; if the VERY NEXT update
+# is another /feed, it shows the below-threshold pool ("You insisted") once and
+# disarms — the next /feed is then evaluated fresh (plain message if still
+# nothing new, normal feed if new above-threshold articles arrived). Any other
+# interaction between the two /feeds breaks the chain. MIN_SCORE <= 0 never
+# insists (nothing is below the threshold by definition).
+_feed_insist_armed: set[int] = set()
+_empty_feed_upid: dict[int, int] = {}
+_upid_hist: dict[int, tuple[int | None, int | None]] = {}
+
+async def _note_update(update: Update, context) -> None:
+    """Group -1 hook: records (current, previous) update ids per chat so
+    "immediately repeated /feed" detection works."""
+    try:
+        chat = update.effective_chat
+        if chat is None or update.update_id is None:
+            return
+        _prev = _upid_hist.get(chat.id, (None, None))[0]
+        _upid_hist[chat.id] = (update.update_id, _prev)
+    except Exception:
+        pass
+
 # token → (snapshot, page_size, offset, [nav_msg_id, *card_msg_ids])
 _feed_state: dict[str, tuple[list[dict], int, int, list[int]]] = {}
 _feed_token: int = 0
@@ -2116,9 +2158,33 @@ async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         snapshot = digest_snapshot()
 
     if not snapshot:
+        chat_id = update.effective_chat.id  # type: ignore[union-attr]
+        _cur, _prev = _upid_hist.get(chat_id, (None, None))
+        immediate = (_prev is not None and _prev == _empty_feed_upid.get(chat_id))
+        if S("MIN_SCORE") > 0 and chat_id in _feed_insist_armed and immediate:
+            # one-shot insist: surface the below-threshold pool, then disarm
+            _feed_insist_armed.discard(chat_id)
+            _empty_feed_upid.pop(chat_id, None)
+            below = below_threshold_snapshot()
+            if below:
+                await update.message.reply_text(  # type: ignore[union-attr]
+                    f"You insisted — showing {len(below)} article{'s' if len(below) != 1 else ''} "
+                    f"below your MIN_SCORE ({S('MIN_SCORE'):g}):")
+                await render_feed_page(ctx.bot, chat_id, below, 0, n,
+                                       title="Below MIN_SCORE (you insisted)")
+            else:
+                await update.message.reply_text(  # type: ignore[union-attr]
+                    "No more scored articles at all. Perhaps /unseen can quench the thirst?")
+            return
+        if S("MIN_SCORE") > 0:
+            # (re)arm on empty /feed; a broken chain just refreshes the anchor
+            _feed_insist_armed.add(chat_id)
+            _empty_feed_upid[chat_id] = update.update_id  # type: ignore[union-attr]
         await update.message.reply_text("Nothing new above your threshold.")  # type: ignore[union-attr]
         return
 
+    _feed_insist_armed.discard(update.effective_chat.id)  # type: ignore[union-attr]
+    _empty_feed_upid.pop(update.effective_chat.id, None)  # type: ignore[union-attr]
     await render_feed_page(ctx.bot, update.effective_chat.id, snapshot, 0, n)
 
 async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2721,15 +2787,15 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Too old breakdown ({too_old}):\n"
         f"  ✓ Liked: {t_liked}\n"
         f"  ✗ Explicitly disliked: {t_disliked}\n"
-        f"  ➖ Ignored (no reaction): {t_ignored}\n"
-        f"  Seen (sent, no reaction yet): {t_sent}\n"
+        f"  ➖ Ignored (no reaction within {S('IGNORE_AFTER_H')}h): {t_ignored}\n"
+        f"  Seen (no reaction — pending {S('IGNORE_AFTER_H')}h or score-exempt): {t_sent}\n"
         f"  Unseen — see /unseen: {t_ready}\n"
         f"\n"
         f"Recent breakdown ({recent}):\n"
         f"  ✓ Liked: {r_liked}\n"
         f"  ✗ Explicitly disliked: {r_disliked}\n"
-        f"  ➖ Ignored (no reaction): {r_ignored}\n"
-        f"  Seen (sent, no reaction yet): {r_sent}\n"
+        f"  ➖ Ignored (no reaction within {S('IGNORE_AFTER_H')}h): {r_ignored}\n"
+        f"  Seen (no reaction — pending {S('IGNORE_AFTER_H')}h or score-exempt): {r_sent}\n"
         f"  Ready for /feed: {r_ready}\n"
         f"  Below MIN_SCORE ({S('MIN_SCORE')}): {r_low}\n"
         f"  Unscored: {r_unscored}\n"
@@ -3117,6 +3183,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).request(request).concurrent_updates(True).build()
 
     owner = filters.Chat(chat_id=TELEGRAM_CHAT_ID)
+    app.add_handler(TypeHandler(Update, _note_update), group=-1)
     app.add_handler(CommandHandler("start",    cmd_start,     filters=owner))
     app.add_handler(CommandHandler("feed",     cmd_feed,      filters=owner))
     app.add_handler(CommandHandler("digest",   cmd_digest,    filters=owner))
