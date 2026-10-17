@@ -231,7 +231,7 @@ point `<BACKEND>_BASE_URL` (e.g. `LLAMACPP_BASE_URL`) at a local
 | Command | What it does |
 |---|---|
 | `/start` | Hello + bot commands |
-| `/feed` | Get the current pending feed (fresh scored articles) |
+| `/feed` | Get the current pending feed (fresh scored articles). If it comes up empty, an immediate second `/feed` shows below-threshold articles ("You insisted") — once; any other command in between resets it. Only meaningful when `MIN_SCORE` > 0. |
 | `/unseen` | Old never-seen articles too old for /feed (sorted score DESC, then oldest-first) |
 | `/digest` | Push the compact daily digest now (new + unseen articles) |
 | `/fetch` | Force a feed fetch + scoring cycle |

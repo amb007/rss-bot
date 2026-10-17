@@ -77,7 +77,7 @@ profile**, which the bot uses when scoring new articles.
 
 | Command | What it does |
 |---|---|
-| `/feed` | Show your current best articles right now (instead of waiting for the daily digest). Add a number to change the count, e.g. `/feed 5`. |
+| `/feed` | Show your current best articles right now (instead of waiting for the daily digest). Add a number to change the count, e.g. `/feed 5`. If it comes up empty, an immediate second `/feed` shows articles below your threshold ("You insisted") — once; anything else you send in between resets it. Only meaningful when `MIN_SCORE` > 0. |
 | `/unseen` | Show old articles that were never seen and are now too old for `/feed` (the backlog `/feed` can't reach). Add a count, e.g. `/unseen 5`. |
 | `/digest` | Pull the compact daily digest now (new + unseen articles) instead of waiting for the scheduled push |
 | `/fetch` | Pull the newest articles from your subscribed feeds now (usually you don't need to — the bot does this itself every 30 minutes) |
