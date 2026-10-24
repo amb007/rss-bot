@@ -1488,4 +1488,28 @@ finally:
     r.render_feed_page = _orig_rfp
     r.set_setting("MIN_SCORE", _old_ms)
 
+# --- digest dedup: syndicated duplicates (same title, different URL) appear once ---
+import inspect as _insp3
+assert "top news picks" not in _insp3.getsource(r._digest_theme), \
+    "theme prompt must not invite the LLM to echo 'top news picks'"
+
+def _mkdup(rid, title, score, hnpts=0, hncmts=0):
+    return {"id": rid, "title": title, "source": "s", "score": score,
+            "url": f"u{rid}", "hn_points": hnpts, "hn_comments": hncmts}
+
+random.seed(7)
+dup_pool = [
+    _mkdup("d1", "Same Story Here", 12, hnpts=100, hncmts=50),
+    _mkdup("d2", "same story  here", 11, hnpts=100, hncmts=50),   # dup of d1 (diff id/url)
+    _mkdup("d3", "Other Article", 10, hnpts=90, hncmts=40),
+    _mkdup("d4", "Third One", 9, hnpts=80, hncmts=30),
+    _mkdup("d5", "Fourth Item", 8, hnpts=70, hncmts=20),
+]
+top_d, disc_d, skim_d = r.group_digest(dup_pool, budget=8, top_n=4)
+all_ids = [x["id"] for x in top_d + disc_d + skim_d]
+assert all_ids.count("d1") == 1 and "d2" not in all_ids, \
+    f"syndicated dup must appear once: {all_ids}"
+assert "d3" in all_ids and "d4" in all_ids and "d5" in all_ids
+print("digest dedup (same-title syndicated copy) OK")
+
 print("ALL TESTS PASSED")

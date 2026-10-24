@@ -1597,15 +1597,33 @@ def _digest_hn(r) -> int:
 def group_digest(pool: list[dict], budget: int = 8, top_n: int = 4):
     """Split the digest pool into (top_picks, discussed, skim) sections.
     Top picks = random sample from top 20 by score; discussed = most HN-active;
-    the rest skim. Never returns more than `budget` rows total."""
+    the rest skim. Never returns more than `budget` rows total. Duplicate
+    stories (same normalized title — e.g. syndicated copies with different feed
+    URLs pointing at the same HN item) are kept only on first appearance."""
     # Randomize top picks: sample from top 20 (or all if fewer) instead of
     # always taking the absolute top N. This adds variety across digests and
     # prevents /feed from always starting with the same articles.
     import random
-    candidate_pool = pool[:20]  # consider top 20 by score
+    seen_titles: set[str] = set()
+
+    def _norm_title(r) -> str:
+        return " ".join((r.get("title") or "").lower().split())
+
+    # dedup up front — pool is score-ordered, so the highest-scored copy of a
+    # syndicated duplicate wins deterministically (not whichever the random
+    # sample happens to draw first)
+    deduped = []
+    for r in pool:
+        nt = _norm_title(r)
+        if not nt or nt not in seen_titles:   # untitled rows can't be deduped
+            if nt:
+                seen_titles.add(nt)
+            deduped.append(r)
+
+    candidate_pool = deduped[:20]  # consider top 20 by score
     top = random.sample(candidate_pool, min(top_n, len(candidate_pool)))
     top_ids = {r["id"] for r in top}
-    rest = [r for r in pool if r["id"] not in top_ids]
+    rest = [r for r in deduped if r["id"] not in top_ids]
     with_hn = [r for r in rest if _digest_hn(r) > 0]
     discussed = sorted(with_hn, key=_digest_hn, reverse=True)[:3]
     disc_ids = {r["id"] for r in discussed}
@@ -1723,7 +1741,8 @@ async def _digest_theme(pool: list[dict]) -> str:
         f"Return ONLY a JSON object with one key: \"lines\" containing an array of "
         f"exactly {n_lines} short strings. No extra text, no reasoning, no markdown."
         f"Each string = one summary line. Summarize the common theme of today's "
-        f"top news picks and why they matter.\n\n"
+        f"most relevant new stories and why they matter. "
+        f"Never use the phrase 'top picks'.\n\n"
         f"Titles:\n{ctx}"
     )
     
