@@ -226,12 +226,33 @@ point `<BACKEND>_BASE_URL` (e.g. `LLAMACPP_BASE_URL`) at a local
 
 ---
 
+### Adaptive score calibration (like/dislike → bucket offsets)
+
+A reaction is a verdict on the scorer's *raw* score: 👍 = false negative for that
+10-pt bucket ("should have been higher"), 👎 = false positive ("should have been
+lower"). Verdicts accumulate per bucket in `score_calibration` (decayed at
+`CAL_DECAY_PCT_PER_DAY`, default 97%/day) and become a bounded offset
+(`CAL_MAX_OFFSET`, default ±30, tanh-scaled — one verdict ≈ ±9) applied to raw
+scores at scoring time. `articles.raw_score` keeps the LLM's verdict; `score` is
+the calibrated final. `/stats` FN/FP buckets stay keyed on raw, so historical
+verdicts don't shift as offsets change. Removing a reaction does not reverse the
+verdict (it decays on its own).
+
+- `/calibration` — inspect: per-bucket net/offset + recent verdicts
+- `/recalibrate` — one-shot re-apply of current offsets to unsent, never-reacted scores
+
+Scorer scale (Oct 26): 50 is the engage/skip midpoint, with symmetric graded anchors
+tied to profile evidence — 95+ only for content close to LIKED examples, 1–5 territory
+for content close to DISLIKES examples, and 0 gated to content matching SEVERAL
+DISLIKES examples (a single 👎 now grades similar content 1–9 instead of nuking the
+topic to 0).
+
 ## Floor commands (owner-only)
 
 | Command | What it does |
 |---|---|
 | `/start` | Hello + bot commands |
-| `/feed` | Get the current pending feed (fresh scored articles). If it comes up empty, an immediate second `/feed` shows below-threshold articles ("You insisted") — once; any other command in between resets it. Only meaningful when `MIN_SCORE` > 0. |
+| `/feed` | Get the current pending feed (fresh scored articles). An empty reply adds live hints — the older-unseen backlog (`/unseen`) and any just-below-threshold pool (`/feed` again to insist). Insisting: an immediate second `/feed` shows below-threshold articles ("You insisted") — once; any other command in between resets it. Only meaningful when `MIN_SCORE` > 0. |
 | `/unseen` | Old never-seen articles too old for /feed (sorted score DESC, then oldest-first) |
 | `/digest` | Push the compact daily digest now (new + unseen articles) |
 | `/fetch` | Force a feed fetch + scoring cycle |

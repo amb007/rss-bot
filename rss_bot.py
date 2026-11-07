@@ -6,7 +6,7 @@ Requirements:
     pip install feedparser python-telegram-bot apscheduler httpx python-dotenv
 """
 
-import os, json, hashlib, logging, asyncio, re, email.utils, signal, time, threading
+import os, json, hashlib, logging, asyncio, re, email.utils, signal, time, threading, math
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
@@ -96,6 +96,8 @@ SETTING_DEFAULTS = {
     "LLM_MIN_INTERVAL":     "3",
     "LLM_MAX_RETRIES":      "4",
     "LLM_HTTP_TIMEOUT":     "90",  # per-attempt HTTP timeout (s); fast-fail so retries+fallback fit the batch window
+    "CAL_DECAY_PCT_PER_DAY": "97",  # calibration evidence keeps 97%/day (scorer prompt + taste evolve)
+    "CAL_MAX_OFFSET":       "30",    # max |offset| per 10-pt bucket, approached asymptotically (tanh)
     "AUTOMODEL_ENABLED":    "1",
     "SWE_REFRESH_DAYS":     "7",
     "MODEL_PROBE_REFRESH_HOURS": "6",   # "ok" probe older than this is stale
@@ -249,6 +251,11 @@ def init_db():
             last_seen   TEXT,
             PRIMARY KEY (backend, model_id)
         );
+        CREATE TABLE IF NOT EXISTS score_calibration (
+            bucket     INTEGER PRIMARY KEY,  -- raw score // 10 (0..9)
+            net        REAL NOT NULL DEFAULT 0,  -- decayed likes - dislikes
+            updated_at TEXT
+        );
         CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
             title, summary, content='articles', content_rowid='rowid',
             tokenize='unicode61'
@@ -273,7 +280,7 @@ def init_db():
     c.execute("PRAGMA synchronous = NORMAL")
     c.execute("PRAGMA journal_size_limit = 67108864")
     # migrations
-    for col, typedef in [("tg_msg_id", "INTEGER"), ("feed_url", "TEXT"), ("feed_id", "INTEGER"), ("disliked_at", "TEXT"), ("hn_points", "INTEGER"), ("hn_comments", "INTEGER"), ("confidence", "TEXT")]:
+    for col, typedef in [("tg_msg_id", "INTEGER"), ("feed_url", "TEXT"), ("feed_id", "INTEGER"), ("disliked_at", "TEXT"), ("hn_points", "INTEGER"), ("hn_comments", "INTEGER"), ("confidence", "TEXT"), ("raw_score", "INTEGER")]:
         try:
             with db() as c:
                 c.execute(f"ALTER TABLE articles ADD COLUMN {col} {typedef}")
@@ -288,6 +295,11 @@ def init_db():
                 c.execute("ALTER TABLE articles RENAME COLUMN shared_at TO liked_at")
     except Exception:
         pass
+
+    # calibration backfill: legacy scored articles have raw_score = score
+    # (idempotent; never overwrites an explicit raw_score)
+    with db() as c:
+        c.execute("UPDATE articles SET raw_score = score WHERE raw_score IS NULL AND score IS NOT NULL")
 
     # sync feeds.txt ↔ feeds table
     _sync_feeds_with_file()
@@ -1265,6 +1277,7 @@ async def score_unscored(notify_busy=None):
         return -1
     async with _scoring_lock:
         cutoff = age_cutoff()
+        cal_age_all()  # decay calibration evidence before this run applies offsets
         while True:
             with db() as c:
                 rows = c.execute("""
@@ -1313,13 +1326,15 @@ Articles user explicitly disliked:
 {dis_text}
 {cal_block}({auto_ignored_count} articles were sent but the user never reacted — weak negative signal)
 
-For each article, score how well it matches the user's taste profile:
-  90-100 = perfect match, must-read
+For each article, score how well it matches the user's taste profile.
+50 is the midpoint: above it the user would engage, below it the user would skip.
+  90-100 = perfect match, must-read; 95+ only for content close to the user's LIKED examples
   70-89  = strong match, very likely to interest
   50-69  = moderate match
   20-49  = weak match
-  1-19   = poor match
-  0      = about something the user explicitly dislikes
+  1-19   = poor match; content close to DISLIKES examples belongs here (the closer, the lower)
+  0      = only for content closely matching SEVERAL DISLIKES examples; a single
+           disliked article makes similar content score 1-9, never 0
 
 Be critical — high scores should be rare. Use the full range. Defaulting to 50 is discouraged.
 Some articles include hn_points and hn_comments (from Hacker News). Higher points = strong community interest (positive signal). Comments indicate engagement but can mean controversy — use as a mild positive.
@@ -1349,10 +1364,14 @@ Reply ONLY with a JSON array: [{{"id":"...","score":N,"confidence":"high|medium|
                 with db() as c:
                     for item in scores:
                         confidence = item.get("confidence") if isinstance(item, dict) else None
-                        c.execute("UPDATE articles SET score=?, confidence=? WHERE id=?",
-                                  (item["score"], confidence, item["id"]))
+                        raw = int(item["score"])
+                        final = cal_apply(raw)
+                        c.execute("UPDATE articles SET raw_score=?, score=?, confidence=? WHERE id=?",
+                                  (raw, final, confidence, item["id"]))
+                        if final != raw:
+                            logging.info(f"Calibration: {item['id']} raw {raw} -> final {final}")
                         if confidence == "low":
-                            logging.info(f"Low confidence on {item['id']} (score={item['score']})")
+                            logging.info(f"Low confidence on {item['id']} (score={final})")
                     logging.info(f"Scored {len(scores)} articles")
                     if scores:
                         _note_batch_scored()
@@ -1382,6 +1401,66 @@ def _format_article_for_scoring(r, truncate_words):
         extra.append(f"hn_comments={cmts}")
     hn = f" | {' '.join(extra)}" if extra else ""
     return f'id:{r["id"]} | {r["title"]} | {r["source"]} | {summary}{hn}'
+
+# ── score calibration (like/dislike verdicts → per-bucket score offsets) ──────
+
+# A like says "the score should have been HIGHER" (false negative for that score
+# bucket); a dislike says "should have been LOWER" (false positive). Verdicts
+# accumulate per 10-pt bucket of the RAW LLM score, decay over time, and become a
+# bounded offset applied when new articles are scored. Inspect with /calibration.
+
+def cal_age_all():
+    """Decay every bucket's evidence by elapsed time. Called before scoring runs,
+    so offsets reflect current, not historical, disagreements."""
+    now = datetime.now(timezone.utc)
+    decay = int(S("CAL_DECAY_PCT_PER_DAY")) / 100.0
+    with db() as c:
+        for row in c.execute("SELECT bucket, net, updated_at FROM score_calibration WHERE updated_at IS NOT NULL").fetchall():
+            days = max(0.0, (now - datetime.fromisoformat(row["updated_at"])).total_seconds() / 86400)
+            if days > 0:
+                c.execute("UPDATE score_calibration SET net = ?, updated_at = ? WHERE bucket = ?",
+                          (row["net"] * (decay ** days), now.isoformat(), row["bucket"]))
+
+def cal_record(raw_score: int, liked: bool):
+    """Record a like/dislike verdict against the 10-pt bucket holding raw_score.
+    Likes push the bucket's offset up (false negative), dislikes down (false positive)."""
+    b = max(0, min(int(raw_score) // 10, 9))
+    now = datetime.now(timezone.utc)
+    decay = int(S("CAL_DECAY_PCT_PER_DAY")) / 100.0
+    with db() as c:
+        row = c.execute("SELECT net, updated_at FROM score_calibration WHERE bucket = ?", (b,)).fetchone()
+        net = row["net"] if row else 0.0
+        if row and row["updated_at"]:
+            days = max(0.0, (now - datetime.fromisoformat(row["updated_at"])).total_seconds() / 86400)
+            net *= decay ** days
+        net += 1.0 if liked else -1.0
+        c.execute("""INSERT INTO score_calibration (bucket, net, updated_at) VALUES (?, ?, ?)
+                     ON CONFLICT(bucket) DO UPDATE SET net = excluded.net, updated_at = excluded.updated_at""",
+                  (b, net, now.isoformat()))
+
+def _bucket_adj(b: int) -> float:
+    """Signed offset for bucket b: CAL_MAX_OFFSET scaled by tanh(net/3) — one verdict
+    ≈ ±9, a stable pattern of 3+ pushes toward ±23, never beyond ±CAL_MAX_OFFSET."""
+    with db() as c:
+        row = c.execute("SELECT net FROM score_calibration WHERE bucket = ?", (b,)).fetchone()
+    net = row["net"] if row else 0.0
+    return math.tanh(net / 3.0) * float(S("CAL_MAX_OFFSET"))
+
+def bucket_offset(raw_score) -> int:
+    """Correction for a raw LLM score: piecewise-linear between adjacent bucket
+    offsets, so there are no cliffs at bucket edges. 0 with no evidence."""
+    if raw_score is None:
+        return 0
+    raw = max(0, min(int(raw_score), 100))
+    b = min(raw // 10, 9)
+    t = (raw - b * 10) / 10.0 if raw < 100 else 0.0
+    return int(round(_bucket_adj(b) * (1 - t) + _bucket_adj(min(b + 1, 9)) * t))
+
+def cal_apply(raw_score) -> int:
+    """Raw LLM score → final score under the user's current calibration."""
+    if raw_score is None:
+        return 0
+    return max(0, min(100, int(raw_score) + bucket_offset(raw_score)))
 
 # ── ignore detection ──────────────────────────────────────────────────────────
 
@@ -2199,7 +2278,23 @@ async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # (re)arm on empty /feed; a broken chain just refreshes the anchor
             _feed_insist_armed.add(chat_id)
             _empty_feed_upid[chat_id] = update.update_id  # type: ignore[union-attr]
-        await update.message.reply_text("Nothing new above your threshold.")  # type: ignore[union-attr]
+        hints = []
+        with db() as c:  # old, never-seen backlog — invisible to /feed by age
+            unseen_n = c.execute("""
+                SELECT COUNT(*) FROM articles
+                WHERE sent_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL
+                  AND published < ?
+            """, (age_cutoff(),)).fetchone()[0]
+        if unseen_n:
+            hints.append(f"{unseen_n} older unseen article{'s' if unseen_n != 1 else ''} — try /unseen")
+        if S("MIN_SCORE") > 0:
+            below_n = len(below_threshold_snapshot())
+            if below_n:
+                hints.append(f"{below_n} just below threshold — /feed again to insist")
+        msg = "Nothing new above your threshold."
+        if hints:
+            msg += "\n" + "\n".join(f"· {h}" for h in hints)
+        await update.message.reply_text(msg)  # type: ignore[union-attr]
         return
 
     _feed_insist_armed.discard(update.effective_chat.id)  # type: ignore[union-attr]
@@ -2763,8 +2858,10 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         r_low     = c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL AND score IS NOT NULL AND score < ?", (cutoff, S("MIN_SCORE"))).fetchone()[0]
         r_unscored= c.execute("SELECT COUNT(*) FROM articles WHERE published >= ? AND sent_at IS NULL AND ignored_at IS NULL AND disliked_at IS NULL AND score IS NULL", (cutoff,)).fetchone()[0]
 
+        # FN/FP buckets are keyed on the RAW score (the scorer's verdict at reaction
+        # time) so calibration offsets don't re-bucket historical verdicts
         buckets = c.execute("""
-            SELECT MIN(CAST(score/10 AS INTEGER), 9) * 10 AS bucket,
+            SELECT MIN(CAST(COALESCE(raw_score, score)/10 AS INTEGER), 9) * 10 AS bucket,
                    SUM(CASE WHEN liked_at IS NOT NULL THEN 1 ELSE 0 END) AS liked,
                    SUM(CASE WHEN disliked_at IS NOT NULL THEN 1 ELSE 0 END) AS disliked
             FROM articles
@@ -2825,6 +2922,51 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+async def cmd_calibration(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show per-bucket calibration: decayed evidence, resulting offsets, recent verdicts."""
+    with db() as c:
+        rows = c.execute("SELECT bucket, net FROM score_calibration WHERE ABS(net) > 1e-9 ORDER BY bucket").fetchall()
+        ev = c.execute("""
+            SELECT raw_score, title, source, liked_at, disliked_at FROM articles
+            WHERE raw_score IS NOT NULL AND (liked_at IS NOT NULL OR disliked_at IS NOT NULL)
+            ORDER BY COALESCE(liked_at, disliked_at) DESC LIMIT 12
+        """).fetchall()
+    lines = ["🔧 Calibration (bucket: net → offset)"]
+    if rows:
+        for row in rows:
+            b = row["bucket"]
+            lines.append(f"  {b*10:3d}-{b*10+9}: net {row['net']:+6.2f} → {_bucket_adj(b):+5.1f}")
+    else:
+        lines.append("  no evidence yet — like/dislike articles to calibrate")
+    if ev:
+        lines.append("")
+        lines.append("Recent verdicts (score shown = raw):")
+        for r_ in ev[:8]:
+            mark = "👍" if r_["liked_at"] else "👎"
+            src = f" ({r_['source']})" if r_["source"] else ""
+            lines.append(f"  {mark} [{int(r_['raw_score'])}] {r_['title'][:56]}{src}")
+    await tg_send(update.message.reply_text, "\n".join(lines), parse_mode=None)  # type: ignore[union-attr]
+
+async def cmd_recalibrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Re-apply current bucket offsets to scores of articles not yet sent or reacted."""
+    cal_age_all()
+    with db() as c:
+        rows = c.execute("""
+            SELECT id, raw_score, score FROM articles
+            WHERE raw_score IS NOT NULL AND sent_at IS NULL
+              AND liked_at IS NULL AND disliked_at IS NULL
+        """).fetchall()
+    changed = 0
+    with db() as c:
+        for row in rows:
+            new = cal_apply(row["raw_score"])
+            if new != int(row["score"] or 0):
+                c.execute("UPDATE articles SET score=? WHERE id=?", (new, row["id"]))
+                changed += 1
+    await tg_send(update.message.reply_text,
+                  f"🔧 Recalibrated {len(rows)} eligible article(s), {changed} score(s) changed.",
+                  parse_mode=None)  # type: ignore[union-attr]
+
 async def cmd_commands(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(  # type: ignore[union-attr]
         f"/feed [n]    — scored digest (default {S('TOP_N')})\n"
@@ -2832,6 +2974,8 @@ async def cmd_commands(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"/unseen [n]  — old articles too old for /feed, never seen\n"
         "/fetch       — fetch new articles from feeds\n"
         "/scoreall    — score all unscored articles\n"
+        "/calibration — like/dislike bucket offsets (view)\n"
+        "/recalibrate — re-apply offsets to unsent scores\n"
         "/model NAME   — switch LLM model (persists to .env)\n"
         "/backend NAME — switch LLM backend (must be configured in .env)\n"
         "/models       — list discovered models + SWE% + health\n"
@@ -3057,7 +3201,7 @@ async def handle_reaction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     with db() as c:
-        row = c.execute("SELECT id, title FROM articles WHERE tg_msg_id=?", (msg_id,)).fetchone()
+        row = c.execute("SELECT id, title, raw_score, score FROM articles WHERE tg_msg_id=?", (msg_id,)).fetchone()
     if not row:
         print(f"REACTION: no article found for message {msg_id}", flush=True)
         return
@@ -3071,6 +3215,16 @@ async def handle_reaction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             c.execute("UPDATE articles SET disliked_at=?, liked_at=NULL WHERE id=?", (now, row["id"]))
             label = "Disliked"
+    raw = row["raw_score"]
+    if raw is None and row["score"] is not None:
+        with db() as c:  # legacy row: raw unknown, treat its stored score as raw
+            c.execute("UPDATE articles SET raw_score=? WHERE id=? AND raw_score IS NULL", (row["score"], row["id"]))
+        raw = row["score"]
+    if raw is not None:
+        cal_record(int(raw), liked=(emoji in like_emojis))
+        print(f"REACTION: calibration bucket {max(0, min(int(raw) // 10, 9))} {'+1' if emoji in like_emojis else '-1'}", flush=True)
+    # note: removing a reaction clears liked_at/disliked_at but does not reverse the
+    # calibration verdict — it was a real signal at the time and decays on its own
     print(f"REACTION: {emoji} → {label} '{row['title']}'", flush=True)
     try:
         await ctx.bot.set_message_reaction(
@@ -3213,6 +3367,8 @@ def main():
     app.add_handler(CommandHandler("get",      cmd_get,       filters=owner))
     app.add_handler(CommandHandler("set",      cmd_set,       filters=owner))
     app.add_handler(CommandHandler("stats",    cmd_stats,     filters=owner))
+    app.add_handler(CommandHandler("calibration", cmd_calibration, filters=owner))
+    app.add_handler(CommandHandler("recalibrate", cmd_recalibrate, filters=owner))
     app.add_handler(CommandHandler("commands", cmd_commands,  filters=owner))
     app.add_handler(CommandHandler("scoreall", cmd_scoreall,  filters=owner))
     app.add_handler(CommandHandler("model",    cmd_model,     filters=owner))

@@ -1421,6 +1421,7 @@ try:
     upd = _U3(101); _tap(upd)
     _asyncio.run(r.cmd_feed(upd, _Cx3()))
     assert any("Nothing new above your threshold." in t for t in upd.message.texts)
+    assert any("2 just below threshold" in t and "insist" in t for t in upd.message.texts), upd.message.texts
     assert r._empty_feed_upid[1] == 101
 
     # 2nd /feed immediately: insist view, disarmed
@@ -1468,6 +1469,30 @@ try:
     assert rfp_calls[-1]["title"] == "Your feed"
     assert rfp_calls[-1]["ids"] == ["fb9"]
     assert 1 not in r._feed_insist_armed and 1 not in r._empty_feed_upid
+
+    # empty /feed hints: old unseen backlog -> /unseen suggestion
+    _now_iso = _dtd.datetime.now(_dtd.timezone.utc).isoformat()
+    with r.db() as c:
+        c.execute("UPDATE articles SET sent_at=? WHERE id='fb9'", (_now_iso,))
+        c.execute("INSERT INTO articles (id,url,title,published,score,fetched_at,summary) VALUES "
+                  "('fbOld','http://x/fbOld','Old unseen','2026-01-01T00:00:00+00:00',20,?,'summary')",
+                  (_now_iso,))
+    upd = _U3(200); _tap(upd)
+    _asyncio.run(r.cmd_feed(upd, _Cx3()))
+    t = upd.message.texts[-1]
+    assert "Nothing new above your threshold." in t
+    assert "/unseen" in t and "1 older unseen" in t, t
+    assert "insist" not in t, t          # below-threshold pool empty -> no insist hint
+    with r.db() as c:
+        c.execute("DELETE FROM articles WHERE id='fbOld'")
+    _tap(_U3(1999))                      # other interaction breaks the insist chain
+    upd = _U3(2000); _tap(upd)
+    _asyncio.run(r.cmd_feed(upd, _Cx3()))
+    t = upd.message.texts[-1]
+    assert "Nothing new above your threshold." in t
+    assert "/unseen" not in t and "insist" not in t, t   # no backlog, no pool -> bare message
+    with r.db() as c:
+        c.execute("DELETE FROM articles WHERE id='fb9'")
     print("/feed insist (simple one-shot) OK")
 
     # MIN_SCORE <= 0: never arms, never insists
@@ -1511,5 +1536,117 @@ assert all_ids.count("d1") == 1 and "d2" not in all_ids, \
     f"syndicated dup must appear once: {all_ids}"
 assert "d3" in all_ids and "d4" in all_ids and "d5" in all_ids
 print("digest dedup (same-title syndicated copy) OK")
+
+# --- score calibration: like/dislike verdicts -> per-bucket score offsets ---
+import asyncio as _cal_aio
+from datetime import datetime as _cal_dt, timedelta as _cal_td, timezone as _cal_tz
+
+with r.db() as c:
+    c.execute("DELETE FROM score_calibration")
+
+# no evidence -> zero offsets everywhere
+assert r.bucket_offset(0) == 0 and r.bucket_offset(55) == 0 and r.bucket_offset(100) == 0
+assert r.bucket_offset(None) == 0
+
+# one like on raw 12 -> ~+9 in bucket 1, tapering to 0 at the bucket's top edge
+r.cal_record(12, liked=True)
+off1 = r.bucket_offset(12)
+assert 7 <= off1 <= 10, off1
+assert r.bucket_offset(19) < off1, (off1, r.bucket_offset(19))
+assert r.bucket_offset(20) == 0, r.bucket_offset(20)   # no cliff at the bucket edge
+assert r.bucket_offset(15) == round(r._bucket_adj(1) * 0.5)  # mid-bucket = half the (unrounded) anchor
+
+# dislike on raw 85 -> negative offset in bucket 8, no cross-talk into bucket 1
+r.cal_record(85, liked=False)
+assert -10 <= r.bucket_offset(85) <= -4, r.bucket_offset(85)
+assert r.bucket_offset(12) == off1, "bucket 8 evidence must not move bucket 1"
+
+# sign flip: dislike alone drives a bucket negative
+with r.db() as c:
+    c.execute("DELETE FROM score_calibration")
+r.cal_record(45, liked=False)
+assert r.bucket_offset(45) < 0
+with r.db() as c:
+    c.execute("DELETE FROM score_calibration")
+
+# saturation: 4 likes push toward the bound but never past +CAL_MAX_OFFSET
+for _ in range(4):
+    r.cal_record(31, liked=True)
+sat = r.bucket_offset(31)
+assert 20 <= sat <= 30, sat
+
+# cal_apply clamps to 0..100
+assert r.cal_apply(None) == 0
+assert 0 <= r.cal_apply(99) <= 100
+
+# evidence decays: 30-day-old net=3 shrinks to ~1.2 (0.97^30)
+with r.db() as c:
+    c.execute("DELETE FROM score_calibration")
+    c.execute("INSERT INTO score_calibration (bucket, net, updated_at) VALUES (3, 3.0, ?)",
+              ((_cal_dt.now(_cal_tz.utc) - _cal_td(days=30)).isoformat(),))
+r.cal_age_all()
+with r.db() as c:
+    net = c.execute("SELECT net FROM score_calibration WHERE bucket=3").fetchone()["net"]
+assert 1.0 < net < 1.4, net
+assert 10 <= r.bucket_offset(31) <= 14, r.bucket_offset(31)
+with r.db() as c:
+    c.execute("DELETE FROM score_calibration")
+print("calibration offsets OK")
+
+# legacy backfill: init_db gives scored rows raw_score = score
+with r.db() as c:
+    c.execute("INSERT OR REPLACE INTO articles (id,url,title,published,score) VALUES "
+              "('cal-legacy','http://x/legacy','Legacy','2026-01-01T00:00:00+00:00',40)")
+r.init_db()
+with r.db() as c:
+    raw = c.execute("SELECT raw_score FROM articles WHERE id='cal-legacy'").fetchone()["raw_score"]
+    c.execute("DELETE FROM articles WHERE id='cal-legacy'")
+assert raw == 40, raw
+print("raw_score backfill OK")
+
+# end-to-end: scoring applies the offset and stores raw vs final
+_orig_llm_chat3 = r.llm_chat
+async def _fake3(messages, max_tokens=512, retries=None):
+    return '[{"id":"cal-e2e","score":15,"confidence":"high"}]'
+r.llm_chat = _fake3
+try:
+    with r.db() as c:  # clear unscored leftovers from earlier sections (fake LLM scores only cal-e2e)
+        c.execute("DELETE FROM articles WHERE score IS NULL AND id != 'cal-e2e'")
+    _ins_art("cal-e2e", "E2E Calibration Article", "summary", None)
+    for _ in range(3):
+        r.cal_record(12, liked=True)          # net=3 in bucket 1
+    _cal_aio.run(r.score_unscored())
+    with r.db() as c:
+        row = c.execute("SELECT raw_score, score FROM articles WHERE id='cal-e2e'").fetchone()
+    assert row["raw_score"] == 15, dict(row)
+    assert row["score"] == r.cal_apply(15), dict(row)
+    assert row["score"] > 15, "positive bucket evidence must lift the final score"
+finally:
+    r.llm_chat = _orig_llm_chat3
+    with r.db() as c:
+        c.execute("DELETE FROM articles WHERE id='cal-e2e'")
+        c.execute("DELETE FROM score_calibration")
+print("calibration end-to-end OK")
+
+# scoring prompt scale: symmetric graded anchors, 50 midpoint, gated 0
+_orig_llm_chat4 = r.llm_chat
+cap4 = {}
+async def _fake4(messages, max_tokens=512, retries=None):
+    cap4["sys"] = messages[0]["content"]
+    return '[{"id":"cal-scale","score":50,"confidence":"high"}]'
+r.llm_chat = _fake4
+try:
+    _ins_art("cal-scale", "Scale Probe", "summary", None)
+    _cal_aio.run(r.score_unscored())
+    sys_prompt = cap4["sys"]
+    assert "50 is the midpoint" in sys_prompt, "50-midpoint contract missing"
+    assert "SEVERAL DISLIKES examples" in sys_prompt, "gated-0 contract missing"
+    assert "95+ only" in sys_prompt, "symmetric liked-anchor missing"
+    assert "explicitly dislikes" not in sys_prompt, "old categorical 0-anchor still present"
+finally:
+    r.llm_chat = _orig_llm_chat4
+    with r.db() as c:
+        c.execute("DELETE FROM articles WHERE id='cal-scale'")
+print("scoring scale (symmetric graded anchors) OK")
 
 print("ALL TESTS PASSED")
